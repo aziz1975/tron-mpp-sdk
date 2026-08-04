@@ -4,6 +4,10 @@ MPP payment method SDK for TRON charge payments. It packages a reusable `tron`
 payment method with separate client and server entry points, following the
 custom payment method pattern from the MPP docs.
 
+For a source-level walkthrough of every entry point and the complete HTTP 402,
+TRON payment, verification, replay-protection, and Receipt flow, see
+[`docs/END_TO_END_FLOW.md`](docs/END_TO_END_FLOW.md).
+
 ## Install
 
 ```sh
