@@ -37,6 +37,31 @@ const mppx = Mppx.create({
 })
 ```
 
+### Replay protection
+
+Each server method atomically claims a successful transaction by its network and
+transaction ID, preventing the same on-chain payment from satisfying multiple
+charges. The default in-memory store is suitable for tests and single-process
+development. Production deployments should provide a shared, persistent atomic
+store so protection survives restarts and works across server instances:
+
+```ts
+import { Mppx, Store, tron } from 'tron-mpp-sdk/server'
+
+const store = Store.redis(redisClientWithAtomicUpdate)
+
+const method = tron({
+  verifier,
+  network: 'mainnet',
+  recipient: 'T...',
+  asset: { type: 'native' },
+  store,
+})
+```
+
+The store must implement MPP's atomic `update` operation. A non-atomic `get`
+followed by `put` is not safe against concurrent credential submissions.
+
 ## Client
 
 ```ts

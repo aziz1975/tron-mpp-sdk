@@ -1,4 +1,4 @@
-import { Challenge, Credential } from 'mppx'
+import { Challenge, Credential, Store } from 'mppx'
 import { describe, expect, it } from 'vitest'
 
 import { charge as clientCharge } from '../src/client/Charge.js'
@@ -153,6 +153,42 @@ describe('TRON MPP charge method', () => {
     ).rejects.toThrow(/reference mismatch/)
   })
 
+  it('rejects a transaction that has already satisfied a charge', async () => {
+    const challenge = createChallenge('challenge-replay')
+    const method = createServerMethod(Store.memory())
+    const verification = createVerification(challenge)
+
+    await expect(method.verify(verification)).resolves.toMatchObject({ status: 'success' })
+    await expect(method.verify(verification)).rejects.toThrow(/already been used/)
+  })
+
+  it('atomically rejects concurrent use of the same transaction', async () => {
+    const challenge = createChallenge('challenge-concurrent-replay')
+    const method = createServerMethod(Store.memory())
+    const verification = createVerification(challenge)
+
+    const results = await Promise.allSettled([
+      method.verify(verification),
+      method.verify(verification),
+    ])
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejection = results.find((result) => result.status === 'rejected') as PromiseRejectedResult
+    expect(rejection.reason).toBeInstanceOf(Error)
+    expect((rejection.reason as Error).message).toMatch(/already been used/)
+  })
+
+  it('shares replay protection across server method instances', async () => {
+    const store = Store.memory()
+    const challenge = createChallenge('challenge-shared-store')
+    const firstMethod = createServerMethod(store)
+    const secondMethod = createServerMethod(store)
+    const verification = createVerification(challenge)
+
+    await expect(firstMethod.verify(verification)).resolves.toMatchObject({ status: 'success' })
+    await expect(secondMethod.verify(verification)).rejects.toThrow(/already been used/)
+  })
+
   it('verifies native TRX transfers with the TronWeb adapter', async () => {
     const payerHex = `41${'22'.repeat(20)}`
     const recipientHex = `41${'11'.repeat(20)}`
@@ -232,3 +268,43 @@ describe('TRON MPP charge method', () => {
     })
   })
 })
+
+function createChallenge(id: string): TronChallenge {
+  return Challenge.fromMethod(Methods.charge, {
+    id,
+    realm: 'api.example.com',
+    request: {
+      amount: '1',
+      asset: { type: 'native' },
+      network: 'nile',
+      recipient,
+    },
+  }) as TronChallenge
+}
+
+function createServerMethod(store: ReturnType<typeof Store.memory>) {
+  return serverCharge({
+    asset: { type: 'native' },
+    network: 'nile',
+    recipient,
+    store,
+    verifier: async ({ credential }) => ({
+      payer: credential.payload.payer,
+      reference: credential.payload.txId,
+    }),
+  })
+}
+
+function createVerification(challenge: TronChallenge) {
+  return {
+    credential: {
+      challenge: challenge as never,
+      payload: {
+        payer,
+        txId,
+        type: Types.transactionCredentialType,
+      },
+    },
+    request: challenge.request as never,
+  }
+}
