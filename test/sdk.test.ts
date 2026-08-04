@@ -211,6 +211,7 @@ describe('TRON MPP charge method', () => {
         },
         async getTransaction() {
           return {
+            ret: [{ contractRet: 'SUCCESS' }],
             raw_data: {
               contract: [
                 {
@@ -231,7 +232,8 @@ describe('TRON MPP charge method', () => {
           return {
             blockNumber: 12,
             blockTimeStamp: 1767225600000,
-            receipt: { result: 'SUCCESS' },
+            contractResult: [''],
+            receipt: { net_usage: 265 },
           }
         },
         async sendTransaction() {

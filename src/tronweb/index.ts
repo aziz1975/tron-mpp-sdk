@@ -85,7 +85,7 @@ export function createTronWebVerifier(
       }),
     ])
 
-    assertTransactionSuccess(transactionInfo, options)
+    assertTransactionSuccess(transaction, transactionInfo, options)
     await assertConfirmations(tronWeb, transactionInfo, request.methodDetails.minConfirmations ?? 0)
 
     const verified =
@@ -218,13 +218,27 @@ function findTransferLog(
   return undefined
 }
 
-function assertTransactionSuccess(transactionInfo: unknown, options: TronWebVerifierOptions) {
+function assertTransactionSuccess(
+  transaction: unknown,
+  transactionInfo: unknown,
+  options: TronWebVerifierOptions,
+) {
   const info = asRecord(transactionInfo)
   if (!Object.keys(info).length && options.allowUnconfirmed) return
 
-  const receipt = asRecord(info.receipt)
-  const result = receipt.result ?? info.contractResult
-  if (result === 'SUCCESS' || result === undefined) return
+  const receiptResult = asRecord(info.receipt).result
+  const transactionResults = asRecord(transaction).ret
+  const transactionResult = Array.isArray(transactionResults)
+    ? asRecord(transactionResults[0]).contractRet
+    : undefined
+  const result = receiptResult ?? transactionResult
+
+  if (result === 'SUCCESS') return
+  if (result === undefined) {
+    throw new Errors.VerificationFailedError({
+      reason: 'TRON transaction result is unavailable',
+    })
+  }
   throw new Errors.VerificationFailedError({ reason: `TRON transaction failed with result ${String(result)}` })
 }
 
