@@ -100,7 +100,7 @@ sequenceDiagram
     TS->>Store: Atomically claim network + transaction ID
     Store-->>TS: Newly claimed
     TS-->>MS: Success Receipt
-    MS-->>API: Payment accepted; attach Receipt to response
+    MS-->>API: Payment accepted and Receipt attached to response
     API-->>MC: 200 + Payment-Receipt header + protected resource
     MC-->>App: Final response
 ```
