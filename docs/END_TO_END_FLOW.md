@@ -58,54 +58,36 @@ chain. A payer private key belongs exclusively to the client wallet.
 sequenceDiagram
     participant App as Calling application
     participant MC as mppx client
-    participant TC as TRON client method
-    participant TW as Signer / TronWeb wallet
-    participant API as Paid HTTP application
-    participant MS as mppx server
-    participant TS as TRON server method
-    participant TV as Verifier / TronWeb adapter
-    participant Node as TRON node or provider
-    participant Store as Atomic replay store
+    participant TC as TRON client and signer
+    participant API as Paid API and mppx server
+    participant TS as TRON method and verifier
+    participant Store as Replay store
+    participant Node as TRON network
 
     App->>MC: fetch(/premium)
     MC->>API: GET /premium
-    API->>MS: Run protected charge handler
-    MS->>TS: Apply defaults and normalize request terms
-    TS-->>MS: Stable economic binding
-    MS-->>API: 402 authenticated Challenge
-    API-->>MC: 402 + Challenge transport headers/body
-    MC->>MC: Parse Challenge and select tron/charge
-    MC->>TC: createCredential(Challenge)
-    TC->>TC: Validate network, currency, and maximum amount
-    TC->>TW: Sign and broadcast exact requested transfer
-    TW->>Node: Submit TRX or TRC-20 transaction
-    Node-->>TW: Transaction ID
-    opt Application requires confirmation before retry
-        TW->>Node: Poll transaction information
-        Node-->>TW: Included transaction / block number
-    end
-    TW-->>TC: payer + transaction ID
+    API-->>MC: 402 + authenticated payment Challenge
+    MC->>TC: Create Credential for selected Challenge
+    TC->>TC: Enforce payer policy
+    TC->>Node: Sign and broadcast exact transfer
+    Node-->>TC: Transaction ID
     TC-->>MC: Serialized MPP Credential
     MC->>API: Retry with Authorization Credential
-    API->>MS: Run the same protected charge handler
-    MS->>MS: Verify Challenge HMAC, expiry, stable binding, and payload schema
-    MS->>TS: verify(parsed Credential, original request)
-    TS->>TS: Validate Credential source binding
-    TS->>TV: Verify transaction payload against Challenge request
-    TV->>Node: Read transaction, receipt, and current block
-    Node-->>TV: On-chain transaction data
-    TV->>TV: Validate status, confirmations, transfer, and payer
-    TV-->>TS: Verified payer, transaction reference, and timestamp
-    TS->>TS: Recheck payer and reference binding
+    API->>API: Authenticate Challenge and validate Credential
+    API->>TS: Verify payment against Challenge terms
+    TS->>Node: Read transaction, receipt, and current block
+    Node-->>TS: On-chain transaction data
+    TS->>TS: Validate status, confirmations, transfer, payer, and reference
     TS->>Store: Atomically claim network + transaction ID
     Store-->>TS: Newly claimed
-    TS-->>MS: Success Receipt
-    MS-->>API: Payment accepted and Receipt attached to response
+    TS-->>API: Success Receipt
     API-->>MC: 200 + Payment-Receipt header + protected resource
     MC-->>App: Final response
 ```
 
-The optional confirmation block is application policy, not behavior built into
+For readability, the diagram groups the TronWeb signer with the TRON client and
+the TronWeb verifier with the TRON server method. Confirmation waiting before
+the Credential retry is application policy, not behavior built into
 `createTronWebSigner()`. The companion test app supplies that polling wrapper so
 its server can safely require `minConfirmations: 1`. Receipt attachment depends
 on the HTTP integration: Fetch API handlers call `withReceipt(response)`, while
