@@ -12,6 +12,7 @@ export const tronAddressPattern = /^T[1-9A-HJ-NP-Za-km-z]{33}$/
 export const tronHexAddressPattern = /^41[0-9a-fA-F]{40}$/
 export const transactionIdPattern = /^[0-9a-fA-F]{64}$/
 export const atomicAmountPattern = /^\d+$/
+export const DecimalsSchema = z.number().check(z.int(), z.minimum(0), z.maximum(255))
 
 export const AtomicAmountSchema = z.string().check(z.regex(atomicAmountPattern, 'Invalid atomic amount'))
 export type AtomicAmount = z.infer<typeof AtomicAmountSchema>
@@ -30,15 +31,15 @@ export const TransactionIdSchema = z
 export type TransactionId = z.infer<typeof TransactionIdSchema>
 
 export const NativeAssetSchema = z.object({
-  decimals: z.optional(z.number()),
-  symbol: z.optional(z.string().check(z.minLength(1))),
+  decimals: z.optional(z.literal(6)),
+  symbol: z.optional(z.literal('TRX')),
   type: z.literal(nativeAssetType),
 })
 export type NativeAsset = z.infer<typeof NativeAssetSchema>
 
 export const Trc20AssetSchema = z.object({
   contractAddress: TronAddressSchema,
-  decimals: z.number(),
+  decimals: DecimalsSchema,
   symbol: z.string().check(z.minLength(1)),
   type: z.literal(trc20AssetType),
 })
@@ -48,8 +49,8 @@ export const AssetSchema = z.union([NativeAssetSchema, Trc20AssetSchema])
 export type Asset = z.infer<typeof AssetSchema>
 
 export const NormalizedNativeAssetSchema = z.object({
-  decimals: z.number(),
-  symbol: z.string().check(z.minLength(1)),
+  decimals: z.literal(6),
+  symbol: z.literal('TRX'),
   type: z.literal(nativeAssetType),
 })
 export type NormalizedNativeAsset = z.infer<typeof NormalizedNativeAssetSchema>
@@ -59,7 +60,7 @@ export type NormalizedAsset = z.infer<typeof NormalizedAssetSchema>
 
 export const MethodDetailsSchema = z.object({
   asset: NormalizedAssetSchema,
-  minConfirmations: z.optional(z.number()),
+  minConfirmations: z.optional(z.number().check(z.int(), z.minimum(0))),
   network: z.string().check(z.minLength(1)),
 })
 export type MethodDetails = z.infer<typeof MethodDetailsSchema>
@@ -78,10 +79,10 @@ export const ChargeRequestInputSchema = z.object({
   amount: z.amount(),
   asset: AssetSchema,
   currency: z.optional(z.string().check(z.minLength(1))),
-  decimals: z.optional(z.number()),
+  decimals: z.optional(z.literal(6)),
   description: z.optional(z.string()),
   externalId: z.optional(z.string()),
-  minConfirmations: z.optional(z.number()),
+  minConfirmations: z.optional(z.number().check(z.int(), z.minimum(0))),
   network: z.string().check(z.minLength(1)),
   recipient: TronAddressSchema,
 })
@@ -89,6 +90,7 @@ export type ChargeRequestInput = z.infer<typeof ChargeRequestInputSchema>
 
 export const TransactionPayloadSchema = z.object({
   payer: TronAddressSchema,
+  signature: z.string().check(z.regex(/^(0x)?[0-9a-fA-F]{130}$/, 'Invalid payer signature')),
   txId: TransactionIdSchema,
   type: z.literal(transactionCredentialType),
 })
@@ -118,10 +120,12 @@ export type ChargeVerifier = (parameters: {
 }) => Promise<VerifiedPayment>
 
 export function normalizeAsset(asset: AssetInput, decimals?: number | undefined): NormalizedAsset {
+  AssetSchema.parse(asset)
   if (asset.type === nativeAssetType) {
+    if (decimals !== undefined && decimals !== 6) throw new Error('TRX requires 6 decimals.')
     return {
-      decimals: decimals ?? asset.decimals ?? 6,
-      symbol: asset.symbol ?? 'TRX',
+      decimals: 6,
+      symbol: 'TRX',
       type: nativeAssetType,
     }
   }
@@ -129,7 +133,13 @@ export function normalizeAsset(asset: AssetInput, decimals?: number | undefined)
 }
 
 export function currencyOf(asset: NormalizedAsset): string {
-  return asset.type === nativeAssetType ? asset.symbol : asset.contractAddress
+  return asset.type === nativeAssetType ? 'TRX' : asset.contractAddress
+}
+
+export function assertCanonicalCurrency(request: ChargeRequest) {
+  if (request.currency !== currencyOf(request.methodDetails.asset)) {
+    throw new Error('TRON currency does not match the payment asset.')
+  }
 }
 
 export function toSource(parameters: { address: TronAddress; network: string }) {

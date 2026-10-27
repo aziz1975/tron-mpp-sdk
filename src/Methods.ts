@@ -23,8 +23,11 @@ export const charge = Method.from({
           network,
           recipient,
           ...request
-        }: Types.ChargeRequestInput) => {
+        }: Types.ChargeRequestInput): Types.ChargeRequest => {
           const normalizedAsset = Types.normalizeAsset(asset, decimals)
+          if (currency !== undefined && currency !== Types.currencyOf(normalizedAsset)) {
+            throw new Error('TRON currency does not match the payment asset.')
+          }
           return {
             ...request,
             amount: parseUnits(amount, normalizedAsset.decimals).toString(),

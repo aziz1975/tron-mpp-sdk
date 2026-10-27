@@ -1,14 +1,17 @@
 import { Challenge, Credential, Store } from 'mppx'
+import { TronWeb, Trx } from 'tronweb'
 import { describe, expect, it } from 'vitest'
 
 import { charge as clientCharge } from '../src/client/Charge.js'
 import * as Methods from '../src/Methods.js'
 import { charge as serverCharge } from '../src/server/Charge.js'
-import { createTronWebVerifier, type TronWebLike } from '../src/tronweb/index.js'
+import { createTronWebSigner, createTronWebVerifier, type TronWebLike } from '../src/tronweb/index.js'
 import * as Types from '../src/Types.js'
+import { paymentProofMessage } from '../src/Proof.js'
 
 const recipient = 'TQGfKPHs3AwiBT44ibkCU64u1G4ttojUXU' as Types.TronAddress
-const payer = 'TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7' as Types.TronAddress
+const privateKey = '1'.repeat(64)
+const payer = TronWeb.address.fromPrivateKey(privateKey) as Types.TronAddress
 const txId = 'a'.repeat(64) as Types.TransactionId
 
 type TronChallenge = {
@@ -20,6 +23,77 @@ type TronChallenge = {
 }
 
 describe('TRON MPP charge method', () => {
+  it('accepts the installed TronWeb API in both adapters', () => {
+    const tronWeb = new TronWeb({ fullHost: 'http://127.0.0.1:8090', privateKey })
+    expect(createTronWebSigner(tronWeb, { network: 'nile' })).toBeTypeOf('function')
+    expect(createTronWebVerifier(tronWeb, { network: 'nile' })).toBeTypeOf('function')
+  })
+
+  it('passes native atomic amounts as safe numbers to TronWeb', async () => {
+    const tronWeb = new TronWeb({ fullHost: 'http://127.0.0.1:8090', privateKey })
+    let sends = 0
+    const signer = createTronWebSigner({
+      address: tronWeb.address,
+      defaultAddress: { base58: payer },
+      trx: {
+        signMessageV2: (message) => Trx.signMessageV2(message, privateKey),
+        getTransaction: async () => ({}),
+        getTransactionInfo: async () => ({}),
+        sendTransaction: async (to, amount) => {
+          sends++
+          expect(to).toBe(recipient)
+          expect(amount).toBe(1250000)
+          return { result: true, transaction: { txID: txId } }
+        },
+      },
+    }, { network: 'nile' })
+    const request: Types.ChargeRequest = {
+      ...createChallenge('native-signer').request,
+      amount: '1250000',
+    }
+    await expect(signer({ challengeId: 'native-signer', request })).resolves.toMatchObject({ txId, payer })
+    await expect(signer({
+      challengeId: 'unsafe-native',
+      request: { ...request, amount: '9007199254740993' },
+    })).rejects.toThrow(/safe integer/)
+    expect(sends).toBe(1)
+  })
+
+  it('normalizes a USDT charge and signs a TRC-20 transfer', async () => {
+    const asset = { type: 'trc20', symbol: 'USDT', decimals: 6, contractAddress: recipient } as const
+    const challenge = Challenge.fromMethod(Methods.charge, {
+      id: 'challenge-usdt',
+      realm: 'api.example.com',
+      request: { amount: '1.25', asset, network: 'nile', recipient },
+    })
+    expect(challenge.request.amount).toBe('1250000')
+    expect(challenge.request.currency).toBe(asset.contractAddress)
+
+    const tronWeb = new TronWeb({ fullHost: 'http://127.0.0.1:8090', privateKey })
+    const signer = createTronWebSigner({
+      address: tronWeb.address,
+      trx: tronWeb.trx,
+      defaultAddress: { base58: payer },
+      contract: () => ({
+        at: async (address) => {
+          expect(address).toBe(asset.contractAddress)
+          return {
+            transfer: (to, amount) => {
+              expect(to).toBe(recipient)
+              expect(amount).toBe('1250000')
+              return { send: async () => txId }
+            },
+          }
+        },
+      }),
+    }, { network: 'nile' })
+    const method = clientCharge({ signer, maxAmount: '1.25', tokenDecimals: { [recipient]: 6 } })
+    const header = await method.createCredential({ challenge: challenge as never })
+    expect(Credential.deserialize(header).payload).toMatchObject({ payer, txId })
+    const limited = clientCharge({ signer, maxAmount: '1.24', tokenDecimals: { [recipient]: 6 } })
+    await expect(limited.createCredential({ challenge: challenge as never })).rejects.toThrow(/exceeds maxAmount/)
+  })
+
   it('normalizes display amounts to atomic Challenge amounts', () => {
     const challenge = Challenge.fromMethod(Methods.charge, {
       id: 'challenge-1',
@@ -57,17 +131,13 @@ describe('TRON MPP charge method', () => {
     const method = clientCharge({
       currencies: ['TRX'],
       networks: ['nile'],
-      signer: async () => ({
-        payer,
-        txId,
-        type: Types.transactionCredentialType,
-      }),
+      signer: async ({ challengeId, request }) => createPayload({ id: challengeId, request }),
     })
 
     const header = await method.createCredential({ challenge: challenge as never })
     const credential = Credential.deserialize<Types.TransactionPayload>(header)
 
-    expect(credential.payload).toEqual({
+    expect(credential.payload).toMatchObject({
       payer,
       txId,
       type: Types.transactionCredentialType,
@@ -100,11 +170,7 @@ describe('TRON MPP charge method', () => {
     const receipt = await method.verify({
       credential: {
         challenge: challenge as never,
-        payload: {
-          payer,
-          txId,
-          type: Types.transactionCredentialType,
-        },
+        payload: createPayload(challenge),
       },
       request: challenge.request as never,
     })
@@ -141,12 +207,8 @@ describe('TRON MPP charge method', () => {
     await expect(
       method.verify({
         credential: {
-            challenge: challenge as never,
-          payload: {
-            payer,
-            txId,
-            type: Types.transactionCredentialType,
-          },
+          challenge: challenge as never,
+          payload: createPayload(challenge),
         },
         request: challenge.request as never,
       }),
@@ -241,16 +303,12 @@ describe('TRON MPP charge method', () => {
         },
       },
     } satisfies TronWebLike
-    const verifier = createTronWebVerifier(tronWeb)
+    const verifier = createTronWebVerifier(tronWeb, { network: 'nile' })
 
     await expect(
       verifier({
         credential: {
-          payload: {
-            payer,
-            txId,
-            type: Types.transactionCredentialType,
-          },
+          payload: createPayload(createChallenge('adapter')),
         },
         request: {
           amount: '1250000',
@@ -301,12 +359,22 @@ function createVerification(challenge: TronChallenge) {
   return {
     credential: {
       challenge: challenge as never,
-      payload: {
-        payer,
-        txId,
-        type: Types.transactionCredentialType,
-      },
+      payload: createPayload(challenge),
     },
     request: challenge.request as never,
+  }
+}
+
+function createPayload(challenge: { id: string; request: Types.ChargeRequest }): Types.TransactionPayload {
+  return {
+    payer,
+    txId,
+    type: Types.transactionCredentialType,
+    signature: Trx.signMessageV2(paymentProofMessage({
+      challengeId: challenge.id,
+      request: challenge.request,
+      payer,
+      txId,
+    }), privateKey),
   }
 }

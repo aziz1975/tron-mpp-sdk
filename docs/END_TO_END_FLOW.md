@@ -78,6 +78,8 @@ sequenceDiagram
     TS->>Node: Read transaction, receipt, and current block
     Node-->>TS: On-chain transaction data
     TS->>TS: Validate status, confirmations, transfer, payer, and reference
+    TS->>Store: Atomically reserve Challenge ID
+    Store-->>TS: Newly reserved
     TS->>Store: Atomically claim network + transaction ID
     Store-->>TS: Newly claimed
     TS-->>API: Success Receipt
@@ -123,7 +125,7 @@ payment.charge({ amount: '1.25' })
 ```
 
 The shared request transform uses viem's decimal-safe `parseUnits` utility. For
-TRX, which defaults to six decimals:
+TRX, which always uses six decimals:
 
 ```text
 1.25 TRX -> 1250000 sun
@@ -166,7 +168,7 @@ const payment = Mppx.create({
   secretKey: process.env.MPP_SECRET_KEY,
   methods: [
     tron({
-      verifier: createTronWebVerifier(tronWeb),
+      verifier: createTronWebVerifier(tronWeb, { network: 'nile' }),
       network: 'nile',
       recipient: 'T...',
       asset: { type: 'native', symbol: 'TRX', decimals: 6 },
@@ -212,7 +214,7 @@ The paying application registers the client method:
 
 ```ts
 const method = tron({
-  signer: createTronWebSigner(tronWeb),
+  signer: createTronWebSigner(tronWeb, { network: 'nile' }),
   networks: ['nile'],
   currencies: ['TRX'],
   maxAmount: '0.01',
@@ -230,9 +232,11 @@ calls `createCredential()` in `src/client/Charge.ts`.
 Before touching the wallet, the client checks its local policy:
 
 1. The requested network must be in `networks`, when configured.
-2. The requested currency must be in `currencies`, when configured.
+2. The currency must match the actual asset, and must be in `currencies`, when configured.
 3. The atomic amount must not exceed `maxAtomicAmount`, when configured.
-4. The display-unit amount must not exceed `maxAmount`, when configured.
+4. The display-unit amount must not exceed `maxAmount`, when configured. Native
+   TRX uses exactly six decimals; tokens require a matching trusted
+   `tokenDecimals[contractAddress]` entry for this limit.
 
 These are payer protections. They do not replace server verification.
 
@@ -248,6 +252,7 @@ type ChargeSigner = (parameters: {
   type: 'transaction'
   payer: string
   txId: string
+  signature: string
 }>
 ```
 
@@ -260,10 +265,11 @@ library. `createTronWebSigner()` is the included convenience implementation.
 The TronWeb adapter calls:
 
 ```ts
-tronWeb.trx.sendTransaction(request.recipient, request.amount, options)
+tronWeb.trx.sendTransaction(request.recipient, Number(request.amount), options)
 ```
 
-The amount is already in sun.
+The amount is already in sun. The adapter checks it is a positive safe integer
+before converting it to the number required by TronWeb.
 
 ### TRC-20
 
@@ -276,18 +282,24 @@ contract.transfer(request.recipient, request.amount).send(options)
 The amount is already in the token's atomic units.
 
 The base signer returns after broadcast. If the server requires confirmations,
-the application must account for inclusion timing. The end-to-end test app wraps
+the application must account for inclusion timing. Rejected broadcasts throw
+before any payment credential is returned, even when the node response contains
+a signed transaction ID. The end-to-end test app wraps
 the signer and waits for a confirmed transaction before allowing `mppx` to retry.
 
 ## 6. Credential creation
 
-After broadcast, the client builds this payload:
+After a successful broadcast, the signer signs `paymentProofMessage()` with
+TRON `signMessageV2`. The message binds the challenge ID, transaction ID, payer,
+network, asset, amount, currency, recipient, and confirmation requirement. The
+client builds this payload:
 
 ```json
 {
   "type": "transaction",
   "payer": "T...",
-  "txId": "64-character-hex-transaction-id"
+  "txId": "64-character-hex-transaction-id",
+  "signature": "TRON-signMessageV2-signature"
 }
 ```
 
@@ -308,7 +320,7 @@ Challenge, and `Credential.serialize()` produces the value used in the retry's
 HTTP `Authorization` header.
 
 The Credential proves which transaction the server should inspect. The
-transaction ID alone is not trusted as proof of correct payment.
+transaction ID alone is not trusted as proof of correct payment or ownership.
 
 ## 7. Credential retry and core MPP validation
 
@@ -316,7 +328,10 @@ The MPP-aware client retries the original HTTP request with the serialized
 Credential. Before invoking TRON verification, `mppx` validates the Credential
 shape and authenticated Challenge binding.
 
-`src/server/Charge.ts` then checks that the Credential source equals the source
+`src/server/Charge.ts` validates the payload and verifies the payer signature
+against the original Challenge before calling a payment verifier or claiming
+the transaction. Invalid and unsigned proofs are rejected. It also checks that
+the Credential source, when present, equals the source
 derived from its payload payer and the requested network. It passes only the
 transaction payload and the original Challenge request to the configured
 `ChargeVerifier`.
@@ -328,14 +343,20 @@ transaction payload and the original Challenge request to the configured
 - the transaction (`getTransaction`); and
 - transaction information/receipt (`getTransactionInfo`).
 
-It then performs the following checks.
+Both adapters require a configured `network` matching the network served by
+their node. Requests for other networks are rejected before wallet or node
+operations. The verifier then performs the following checks.
 
 ### Transaction execution status
 
-The verifier accepts only `SUCCESS`, read from:
+The verifier rejects every explicit failure from either
+`transactionInfo.receipt.result` or `transaction.ret[0].contractRet`. One success
+field cannot override a failure in the other. With normal settings, transaction
+info and a `SUCCESS` status are required.
 
-- `transactionInfo.receipt.result`, when present; or
-- `transaction.ret[0].contractRet`.
+`allowUnconfirmed: true` permits a missing receipt for pending native transfers,
+but never overrides an explicit failure or swallows an RPC exception. A
+positive `minConfirmations` still requires confirmed block information.
 
 `transactionInfo.contractResult` is not a status. It contains contract return
 data and may be `[""]` for a successful native transfer.
@@ -370,7 +391,10 @@ logs and validates:
 - recipient topic; and
 - atomic transfer amount.
 
-The event's `from` topic becomes the verified payer.
+The event's `from` topic becomes the verified payer. Log contract addresses are
+decoded by length: 20-byte addresses receive the `41` prefix, while 21-byte
+TRON addresses retain it, including contracts whose 20-byte address begins
+with `41`.
 
 ### Payer and reference binding
 
@@ -385,22 +409,30 @@ different transaction or payer.
 
 ## 9. Replay protection
 
-After all verification succeeds, the server atomically claims:
+After all verification succeeds, the server uses two atomic store operations:
 
 ```text
+tron:challenge:<challenge-id>
 tron:charge:<network>:<lowercase-transaction-id>
 ```
 
-The claim uses MPP's `Store.AtomicStore.update()` operation. The callback writes
-the consumption timestamp only when the key does not already exist:
+First it reserves the challenge ID with a unique reservation token. It then
+claims the transaction ID with its consumption timestamp. Each operation uses
+MPP's `Store.AtomicStore.update()` to write only if the key is absent. Both
+markers remain after successful acceptance, preventing either a second payment
+for the same challenge or the same payment for a different challenge.
 
-```text
-missing key  -> store timestamp -> accept
-existing key -> no write        -> reject
-```
+If the transaction was already consumed or its store update throws, the server
+atomically releases its own challenge reservation before returning the failure.
+This lets an unused valid payment retry the challenge. The conditional release
+cannot delete another request's reservation. A failure or process exit that
+leaves a reservation behind rejects further use of that challenge; a fresh
+challenge can be issued. No success is returned until both claims succeed.
 
 Atomic read-modify-write is essential. A separate `get()` followed by `put()`
-would allow two concurrent requests to accept the same transaction.
+would allow two concurrent requests to accept the same challenge or transaction.
+The existing transaction key format is retained, preserving persisted replay
+history from earlier versions.
 
 If no store is supplied, the SDK creates `Store.memory()`. That is appropriate
 for tests and a single long-running process, but it is cleared on restart and is
@@ -408,9 +440,11 @@ not shared between independently configured server instances. Production apps
 must inject one shared persistent atomic store across all instances that accept
 the same payments.
 
-Reusing an accepted transaction produces `VerificationFailedError` with:
+Reusing an accepted challenge or transaction produces `VerificationFailedError`
+with the corresponding reason:
 
 ```text
+TRON challenge has already been used
 TRON transaction has already been used
 ```
 

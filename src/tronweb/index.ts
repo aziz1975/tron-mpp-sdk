@@ -1,6 +1,7 @@
 import { Errors } from 'mppx'
 
 import * as Types from '../Types.js'
+import { paymentProofMessage, verifyPaymentProof } from '../Proof.js'
 
 type MaybePromise<T> = T | Promise<T>
 
@@ -9,7 +10,7 @@ export type TronWebLike = {
     fromHex(address: string): string
     toHex(address: string): string
   }
-  contract?: (abi?: unknown, address?: string) => {
+  contract?: () => {
     at?: (address: string) => MaybePromise<{
       transfer: (
         recipient: string,
@@ -24,18 +25,23 @@ export type TronWebLike = {
     hex?: string | false
   }
   trx: {
+    signMessageV2?: (message: string) => MaybePromise<string>
     getCurrentBlock?: () => Promise<unknown>
     getTransaction: (txId: string) => Promise<unknown>
     getTransactionInfo: (txId: string) => Promise<unknown>
     sendTransaction: (
       recipient: string,
-      amount: string,
+      amount: number,
       options?: Record<string, unknown>,
     ) => Promise<string | { result?: boolean; transaction?: { txID?: string }; txid?: string }>
   }
 }
 
 export type TronWebSignerOptions = {
+  /** Network served by this configured TronWeb instance. */
+  network: string
+  /** Optional wallet callback for TRON signMessageV2; defaults to tronWeb.trx.signMessageV2. */
+  signMessage?: (message: string) => MaybePromise<string>
   /** Wallet address to report as the payer. Defaults to `tronWeb.defaultAddress.base58`. */
   payer?: Types.TronAddress | undefined
   /** Options passed to TRC-20 `transfer(...).send(options)`. */
@@ -45,6 +51,8 @@ export type TronWebSignerOptions = {
 }
 
 export type TronWebVerifierOptions = {
+  /** Network served by this configured TronWeb instance. */
+  network: string
   /** Treat missing transaction info as zero confirmations instead of immediate failure. */
   allowUnconfirmed?: boolean | undefined
 }
@@ -54,17 +62,28 @@ const transferEventTopic =
 
 export function createTronWebSigner(
   tronWeb: TronWebLike,
-  options: TronWebSignerOptions = {},
+  options: TronWebSignerOptions,
 ): Types.ChargeSigner {
-  return async ({ request }) => {
+  assertConfiguredNetwork(options.network)
+  return async ({ challengeId, request: input }) => {
+    const request = Types.ChargeRequestSchema.parse(input)
+    assertNetwork(request, options.network)
+    Types.assertCanonicalCurrency(request)
+    const signMessage = options.signMessage ?? tronWeb.trx.signMessageV2?.bind(tronWeb.trx)
+    if (!signMessage) throw new Error('TRON payments require signMessageV2 to authenticate the payer.')
     const payer = resolvePayer(tronWeb, options)
     const txId =
       request.methodDetails.asset.type === Types.nativeAssetType
         ? await sendNativeTransfer(tronWeb, request, options)
         : await sendTrc20Transfer(tronWeb, request, options)
 
+    const signature = await signMessage(paymentProofMessage({ challengeId, request, payer, txId }))
+    if (!await verifyPaymentProof({ challengeId, request, payer, txId, signature })) {
+      throw new Error('TRON payer signature does not match the payment payer.')
+    }
     return {
       payer,
+      signature,
       txId,
       type: Types.transactionCredentialType,
     }
@@ -73,16 +92,17 @@ export function createTronWebSigner(
 
 export function createTronWebVerifier(
   tronWeb: TronWebLike,
-  options: TronWebVerifierOptions = {},
+  options: TronWebVerifierOptions,
 ): Types.ChargeVerifier {
-  return async ({ credential, request }) => {
+  assertConfiguredNetwork(options.network)
+  return async ({ credential, request: input }) => {
+    const request = Types.ChargeRequestSchema.parse(input)
+    assertNetwork(request, options.network)
+    Types.assertCanonicalCurrency(request)
     const txId = credential.payload.txId
     const [transaction, transactionInfo] = await Promise.all([
       tronWeb.trx.getTransaction(txId),
-      tronWeb.trx.getTransactionInfo(txId).catch((error: unknown) => {
-        if (options.allowUnconfirmed) return undefined
-        throw error
-      }),
+      tronWeb.trx.getTransactionInfo(txId),
     ])
 
     assertTransactionSuccess(transaction, transactionInfo, options)
@@ -110,9 +130,13 @@ async function sendNativeTransfer(
   request: Types.ChargeRequest,
   options: TronWebSignerOptions,
 ): Promise<Types.TransactionId> {
+  const amount = Number(request.amount)
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw new Error('TRON native transfer amount must be a positive safe integer.')
+  }
   const result = await tronWeb.trx.sendTransaction(
     request.recipient,
-    request.amount,
+    amount,
     options.nativeSendOptions,
   )
   return normalizeTxId(result)
@@ -224,22 +248,23 @@ function assertTransactionSuccess(
   options: TronWebVerifierOptions,
 ) {
   const info = asRecord(transactionInfo)
-  if (!Object.keys(info).length && options.allowUnconfirmed) return
-
   const receiptResult = asRecord(info.receipt).result
   const transactionResults = asRecord(transaction).ret
   const transactionResult = Array.isArray(transactionResults)
     ? asRecord(transactionResults[0]).contractRet
     : undefined
-  const result = receiptResult ?? transactionResult
-
-  if (result === 'SUCCESS') return
-  if (result === undefined) {
-    throw new Errors.VerificationFailedError({
-      reason: 'TRON transaction result is unavailable',
-    })
+  for (const result of [receiptResult, transactionResult]) {
+    if (result !== undefined && result !== 'SUCCESS') {
+      throw new Errors.VerificationFailedError({ reason: `TRON transaction failed with result ${String(result)}` })
+    }
   }
-  throw new Errors.VerificationFailedError({ reason: `TRON transaction failed with result ${String(result)}` })
+  if (!Object.keys(info).length) {
+    if (options.allowUnconfirmed) return
+    throw new Errors.VerificationFailedError({ reason: 'TRON transaction info is unavailable' })
+  }
+  if (receiptResult === undefined && transactionResult === undefined) {
+    throw new Errors.VerificationFailedError({ reason: 'TRON transaction result is unavailable' })
+  }
 }
 
 async function assertConfirmations(
@@ -282,12 +307,15 @@ function resolvePayer(tronWeb: TronWebLike, options: TronWebSignerOptions): Type
 }
 
 function normalizeTxId(result: unknown): Types.TransactionId {
-  if (typeof result === 'string') return result as Types.TransactionId
+  if (typeof result === 'string') return Types.TransactionIdSchema.parse(result)
 
   const record = asRecord(result)
+  if (record.result !== undefined && record.result !== true) {
+    throw new Error(`TRON broadcast failed: ${String(record.code ?? record.message ?? 'node rejected transaction')}`)
+  }
   const txId = record.txid ?? asRecord(record.transaction).txID
   if (typeof txId !== 'string') throw new Error('TRON transaction response did not include a txid.')
-  return txId as Types.TransactionId
+  return Types.TransactionIdSchema.parse(txId)
 }
 
 function firstContract(transaction: unknown) {
@@ -308,7 +336,19 @@ function readRequired(record: unknown, key: string) {
 
 function normalizeLogAddress(tronWeb: TronWebLike, address: string) {
   const normalized = address.replace(/^0x/, '')
-  return tronWeb.address.fromHex(normalized.startsWith('41') ? normalized : `41${normalized}`)
+  if (/^[0-9a-fA-F]{40}$/.test(normalized)) return tronWeb.address.fromHex(`41${normalized}`)
+  if (/^41[0-9a-fA-F]{40}$/.test(normalized)) return tronWeb.address.fromHex(normalized)
+  throw new Errors.VerificationFailedError({ reason: 'TRON transfer log has an invalid contract address' })
+}
+
+function assertConfiguredNetwork(network: string) {
+  if (typeof network !== 'string' || !network.trim()) throw new Error('A TRON adapter network is required.')
+}
+
+function assertNetwork(request: Types.ChargeRequest, network: string) {
+  if (request.methodDetails.network !== network) {
+    throw new Errors.VerificationFailedError({ reason: 'TRON adapter network mismatch' })
+  }
 }
 
 function topicToTronAddress(tronWeb: TronWebLike, topic: string | undefined) {

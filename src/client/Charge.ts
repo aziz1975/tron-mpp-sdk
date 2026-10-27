@@ -7,14 +7,14 @@ import * as Types from '../Types.js'
 export function charge(parameters: charge.Parameters) {
   return Method.toClient(Methods.charge, {
     async createCredential({ challenge }) {
-      const request = challenge.request as Types.ChargeRequest
+      const request = Types.ChargeRequestSchema.parse(challenge.request)
 
       assertClientPolicy(parameters, request)
 
-      const payload = await parameters.signer({
+      const payload = Types.TransactionPayloadSchema.parse(await parameters.signer({
         challengeId: challenge.id,
         request,
-      })
+      }))
 
       return Credential.serialize(
         Credential.from({
@@ -42,11 +42,14 @@ export declare namespace charge {
     networks?: readonly string[] | undefined
     /** Optional allowlist of accepted currencies, for example `TRX` or a TRC-20 address. */
     currencies?: readonly string[] | undefined
+    /** Trusted token decimals keyed by TRC-20 contract address, required for token maxAmount. */
+    tokenDecimals?: Readonly<Record<string, number>> | undefined
   }
 }
 
 function assertClientPolicy(parameters: charge.Parameters, request: Types.ChargeRequest) {
   const { maxAmount, maxAtomicAmount, networks, currencies } = parameters
+  Types.assertCanonicalCurrency(request)
 
   if (networks && !networks.includes(request.methodDetails.network)) {
     throw new Error(`TRON network is not allowed: ${request.methodDetails.network}.`)
@@ -64,7 +67,17 @@ function assertClientPolicy(parameters: charge.Parameters, request: Types.Charge
   }
 
   if (maxAmount !== undefined) {
-    const maxUnits = parseUnits(maxAmount, request.methodDetails.asset.decimals)
+    const asset = request.methodDetails.asset
+    const decimals = asset.type === 'native' ? 6 : parameters.tokenDecimals?.[asset.contractAddress]
+    if (decimals === undefined || !Types.DecimalsSchema.safeParse(decimals).success) {
+      throw new Error('Trusted token decimals are required for maxAmount.')
+    }
+    if (asset.decimals !== decimals) throw new Error('TRON token decimals do not match client policy.')
+    if (!/^(0|[1-9]\d*)(\.\d+)?$/.test(maxAmount)) throw new Error('Invalid maxAmount.')
+    if ((maxAmount.split('.')[1]?.length ?? 0) > decimals) {
+      throw new Error('maxAmount exceeds the asset decimal precision.')
+    }
+    const maxUnits = parseUnits(maxAmount, decimals)
     if (BigInt(request.amount) > maxUnits) throw new Error('TRON charge amount exceeds maxAmount.')
   }
 }
