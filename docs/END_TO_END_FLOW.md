@@ -1,560 +1,101 @@
-# TRON MPP SDK: end-to-end architecture
+# TRC-20 payment flow and implementation map
 
-This document explains how `tron-mpp-sdk` participates in a complete paid HTTP
-request, from server configuration through the final MPP Receipt. It describes
-the current `charge` intent for native TRX and TRC-20 transfers.
+The SDK has two payment intents: `tron.charge` for one-time payments and
+`tron.session` for escrow-backed metered service. Both use TRC-20 contract addresses
+as currencies and integer strings for atomic amounts. The method identifier is
+`tron`; transaction construction, networks and signatures use TRON interfaces.
+See [protocol integration](PROTOCOL.md) for configuration examples.
 
-## The entry points
+## Charge flow
 
-There is no single runtime entry point because a payment method has shared,
-client, server, and optional wallet-adapter responsibilities. The npm package
-exposes four entry points:
+1. The application configures a token contract, recipient, numeric chain ID,
+   supported credential types and an atomic replay store.
+2. A request without payment receives HTTP 402 and a `WWW-Authenticate: Payment`
+   challenge. Mppx authenticates it with the server secret. The HTTP transport
+   persists the exact issued challenge before returning it.
+3. The client validates expiry, chain, currency, amount cap, the primary and split
+   recipients against a local allowlist, credential preference, and any locally
+   trusted Permit2 contract/spender before signing or broadcasting.
+4. The client creates one negotiated credential:
+   - `permit2`: signs a challenge-bound typed witness after checking token balance,
+     prior approval and nonce availability; the server submits the token transfer.
+   - `authorization`: signs a token-native transfer authorization with a nonce
+     derived from the challenge; the server submits it. The token must support
+     this operation and its signing domain must be configured explicitly.
+   - `transaction`: signs a TRON protobuf transaction envelope; the server verifies
+     its signature, owner, token, exact transfer calldata and absence of attached
+     native value before broadcasting it.
+   - `hash`: broadcasts the token transfer and returns its confirmed transaction
+     hash. This format has weaker payer/challenge binding.
+5. The client retries with `Authorization: Payment ...`. Mppx verifies the
+   challenge HMAC and route binding; the SDK checks the stored auth-params.
+6. The server validates the credential and simulates server-submitted calls. It
+   reserves outgoing payments before submission, waits for a successful mined
+   receipt and sufficient confirmations, then verifies the required token events.
+   A rejected hash does not consume its challenge.
+7. Atomic challenge and transaction markers prevent duplicate payment use. Success
+   returns a `Payment-Receipt` with the protected response. Retries of a submitted
+   credential confirm its saved hash without another broadcast. The returned charge
+   method also exposes `reconcile(challengeId)` for explicit recovery. Credential
+   rejection returns 402, a fresh challenge and standard Problem Details; unknown
+   submission outcomes remain 503 pending recovery.
 
-| Import path | Source entry point | Responsibility |
-| --- | --- | --- |
-| `tron-mpp-sdk` | `src/index.ts` | Shared method definition, schemas, and types |
-| `tron-mpp-sdk/client` | `src/client/index.ts` | Client payment policy and Credential creation |
-| `tron-mpp-sdk/server` | `src/server/index.ts` | Challenge defaults, verification, replay protection, and Receipts |
-| `tron-mpp-sdk/tronweb` | `src/tronweb/index.ts` | Optional TronWeb signer and verifier adapters |
+## Session flow
 
-For an application, the practical entry points are:
+1. A session challenge quotes a token price per unit, payee, escrow and supported
+   funding formats. The server requires a persistent atomic store.
+2. The wallet opens a channel directly or authorizes a relayed deposit. Its ID binds
+   payer, payee, token, salt, delegated signer, escrow and chain ID.
+   Client `preparePayment` returns an unsigned plan. The SDK checks its spending
+   limit and any existing channel's identity and balance before `wallet.createPayload`
+   signs or broadcasts. Management top-ups may replenish an exhausted channel.
+3. The server confirms that funding affected the exact escrow/channel and verifies
+   the initial voucher and channel state. Sponsored deposits bind channel terms
+   through Permit2 witnesses or deterministic authorization nonces.
+4. The client submits cumulative vouchers. The server verifies signatures before
+   stale-voucher idempotency, checks uint128/deposit limits and minimum increments,
+   and persists the highest accepted amount.
+5. Service consumption atomically advances `spent` before delivery. Request keys
+   prevent duplicate charging through separate durable records and a write-ahead
+   marker. The channel record stays constant in size. Available credit is
+   `min(acceptedCumulative, deposit) - spent`.
+6. The payee settles a persisted voucher or cooperatively closes the channel. The
+   payer can request forced close and recover uncommitted funds after the grace
+   period, during which the payee may still settle. Finalized records stay on-chain
+   so old vouchers cannot be replayed against a reopened channel ID.
+   Confirmed failures release local operation reservations; uncertain submissions
+   require `manager.reconcile` without another broadcast. Closed request history
+   can be pruned after retention, while the closed channel tombstone remains.
 
-```ts
-// Paying application
-import { Mppx, tron } from 'tron-mpp-sdk/client'
+## Naming and responsibilities
 
-// Paid API
-import { Mppx, tron } from 'tron-mpp-sdk/server'
-
-// Either side, when using TronWeb
-import {
-  createTronWebSigner,
-  createTronWebVerifier,
-} from 'tron-mpp-sdk/tronweb'
-```
-
-`tron(...)` is a convenience alias for `tron.charge(...)`. The package currently
-implements only the `charge` intent.
-
-## Responsibility boundaries
-
-Four components collaborate during a payment:
-
-| Component | Owns |
+| Module or function | Responsibility |
 | --- | --- |
-| Application | HTTP route, price, recipient, secrets, wallet/node configuration, and persistent store infrastructure |
-| `mppx` | HTTP 402 flow, authenticated Challenge, Credential serialization, retries, verification lifecycle, and Receipt transport |
-| `tron-mpp-sdk` | TRON schemas, payment policy, signer/verifier contracts, transaction validation, replay protection, and TRON Receipt data |
-| TronWeb/TRON node | Transaction construction, signing, broadcasting, chain queries, address conversion, and confirmation data |
-
-The SDK never reads `MPP_SECRET_KEY`. The server application supplies that
-secret to `Mppx.create()`, and `mppx` uses it to authenticate Challenges. The
-SDK also never needs a server private key: the receiving server only queries the
-chain. A payer private key belongs exclusively to the client wallet.
-
-## Complete request sequence
-
-```mermaid
-sequenceDiagram
-    participant App as Calling application
-    participant MC as mppx client
-    participant TC as TRON client and signer
-    participant API as Paid API and mppx server
-    participant TS as TRON method and verifier
-    participant Store as Replay store
-    participant Node as TRON network
-
-    App->>MC: fetch(/premium)
-    MC->>API: GET /premium
-    API-->>MC: 402 + authenticated payment Challenge
-    MC->>TC: Create Credential for selected Challenge
-    TC->>TC: Enforce payer policy
-    TC->>Node: Sign and broadcast exact transfer
-    Node-->>TC: Transaction ID
-    TC-->>MC: Serialized MPP Credential
-    MC->>API: Retry with Authorization Credential
-    API->>API: Authenticate Challenge and validate Credential
-    API->>TS: Verify payment against Challenge terms
-    TS->>Node: Read transaction, receipt, and current block
-    Node-->>TS: On-chain transaction data
-    TS->>TS: Validate status, confirmations, transfer, payer, and reference
-    TS->>Store: Atomically reserve Challenge ID
-    Store-->>TS: Newly reserved
-    TS->>Store: Atomically claim network + transaction ID
-    Store-->>TS: Newly claimed
-    TS-->>API: Success Receipt
-    API-->>MC: 200 + Payment-Receipt header + protected resource
-    MC-->>App: Final response
-```
-
-For readability, the diagram groups the TronWeb signer with the TRON client and
-the TronWeb verifier with the TRON server method. Confirmation waiting before
-the Credential retry is application policy, not behavior built into
-`createTronWebSigner()`. The companion test app supplies that polling wrapper so
-its server can safely require `minConfirmations: 1`. Receipt attachment depends
-on the HTTP integration: Fetch API handlers call `withReceipt(response)`, while
-`Mppx.toNodeListener()` sets `Payment-Receipt` before the Node application writes
-the body. Failure branches are omitted above; any validation or replay failure
-returns a 402 response and no success Receipt.
-
-## 1. Shared method definition
-
-`src/Methods.ts` defines the method once with `Method.from()`:
-
-```ts
-Method.from({
-  name: 'tron',
-  intent: 'charge',
-  schema: {
-    request: /* TRON charge schema and normalization */,
-    credential: { payload: /* transaction proof schema */ },
-  },
-})
-```
-
-Both client and server wrappers extend this same definition. This guarantees
-that both sides agree on method name, intent, request format, and Credential
-payload.
-
-### Input amount versus wire amount
-
-An API author supplies a display-unit amount:
-
-```ts
-payment.charge({ amount: '1.25' })
-```
-
-The shared request transform uses viem's decimal-safe `parseUnits` utility. For
-TRX, which always uses six decimals:
-
-```text
-1.25 TRX -> 1250000 sun
-```
-
-The Challenge carries the atomic string `"1250000"`. No JavaScript floating
-point arithmetic is used for money.
-
-### Normalized Challenge request
-
-A native TRX request has this logical shape:
-
-```json
-{
-  "amount": "1250000",
-  "currency": "TRX",
-  "recipient": "T...",
-  "description": "Premium endpoint",
-  "methodDetails": {
-    "network": "nile",
-    "asset": {
-      "type": "native",
-      "symbol": "TRX",
-      "decimals": 6
-    },
-    "minConfirmations": 1
-  }
-}
-```
-
-For TRC-20, `asset` additionally includes `contractAddress`, and the default
-`currency` is that contract address rather than the token symbol.
-
-## 2. Server method initialization
-
-The API registers the TRON server method once:
-
-```ts
-const payment = Mppx.create({
-  secretKey: process.env.MPP_SECRET_KEY,
-  methods: [
-    tron({
-      verifier: createTronWebVerifier(tronWeb, { network: 'nile' }),
-      network: 'nile',
-      recipient: 'T...',
-      asset: { type: 'native', symbol: 'TRX', decimals: 6 },
-      minConfirmations: 1,
-      store: replayStore,
-    }),
-  ],
-})
-```
-
-`src/server/Charge.ts` turns the shared method into a server method with
-`Method.toServer()`. Its configuration provides route defaults so callers do
-not repeat the network, recipient, and asset for every endpoint.
-
-The server method also defines a stable binding containing:
-
-- atomic amount;
-- currency;
-- recipient; and
-- all TRON-specific `methodDetails`.
-
-These fields are part of the authenticated Challenge terms. The client cannot
-change them when returning the Credential without invalidating the Challenge.
-
-## 3. Initial request and HTTP 402 Challenge
-
-When a caller requests a protected route without a Credential, `mppx` creates a
-Challenge and returns HTTP `402 Payment Required`. The Challenge identifies:
-
-- method: `tron`;
-- intent: `charge`;
-- server realm;
-- unique authenticated Challenge ID; and
-- normalized request terms.
-
-`MPP_SECRET_KEY` is used by `mppx`, not by this SDK, to create and verify the
-HMAC-bound Challenge ID. This lets the server detect a forged or modified
-Challenge without placing the full Challenge in server-side storage.
-
-## 4. Client method and payment policy
-
-The paying application registers the client method:
-
-```ts
-const method = tron({
-  signer: createTronWebSigner(tronWeb, { network: 'nile' }),
-  networks: ['nile'],
-  currencies: ['TRX'],
-  maxAmount: '0.01',
-})
-
-const { fetch } = Mppx.create({
-  methods: [method],
-  polyfill: false,
-})
-```
-
-After receiving the 402, `mppx` selects the matching `tron/charge` method and
-calls `createCredential()` in `src/client/Charge.ts`.
-
-Before touching the wallet, the client checks its local policy:
-
-1. The requested network must be in `networks`, when configured.
-2. The currency must match the actual asset, and must be in `currencies`, when configured.
-3. The atomic amount must not exceed `maxAtomicAmount`, when configured.
-4. The display-unit amount must not exceed `maxAmount`, when configured. Native
-   TRX uses exactly six decimals; tokens require a matching trusted
-   `tokenDecimals[contractAddress]` entry for this limit.
-
-These are payer protections. They do not replace server verification.
-
-## 5. Signing and broadcasting
-
-The client wrapper calls the configured `ChargeSigner`:
-
-```ts
-type ChargeSigner = (parameters: {
-  challengeId: string
-  request: ChargeRequest
-}) => Promise<{
-  type: 'transaction'
-  payer: string
-  txId: string
-  signature: string
-}>
-```
-
-The signer interface is intentionally independent of TronWeb. Applications may
-integrate a browser wallet, hardware wallet, custody service, or another TRON
-library. `createTronWebSigner()` is the included convenience implementation.
-
-### Native TRX
-
-The TronWeb adapter calls:
-
-```ts
-tronWeb.trx.sendTransaction(request.recipient, Number(request.amount), options)
-```
-
-The amount is already in sun. The adapter checks it is a positive safe integer
-before converting it to the number required by TronWeb.
-
-### TRC-20
-
-The adapter resolves the configured token contract and calls:
-
-```ts
-contract.transfer(request.recipient, request.amount).send(options)
-```
-
-The amount is already in the token's atomic units.
-
-The base signer returns after broadcast. If the server requires confirmations,
-the application must account for inclusion timing. Rejected broadcasts throw
-before any payment credential is returned, even when the node response contains
-a signed transaction ID. The end-to-end test app wraps
-the signer and waits for a confirmed transaction before allowing `mppx` to retry.
-
-## 6. Credential creation
-
-After a successful broadcast, the signer signs `paymentProofMessage()` with
-TRON `signMessageV2`. The message binds the challenge ID, transaction ID, payer,
-network, asset, amount, currency, recipient, and confirmation requirement. The
-client builds this payload:
-
-```json
-{
-  "type": "transaction",
-  "payer": "T...",
-  "txId": "64-character-hex-transaction-id",
-  "signature": "TRON-signMessageV2-signature"
-}
-```
-
-It also creates a source identifier:
-
-```text
-did:pkh:tron:<network>:<payer-address>
-```
-
-For example:
-
-```text
-did:pkh:tron:nile:TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7
-```
-
-`Credential.from()` associates the payload and source with the original
-Challenge, and `Credential.serialize()` produces the value used in the retry's
-HTTP `Authorization` header.
-
-The Credential proves which transaction the server should inspect. The
-transaction ID alone is not trusted as proof of correct payment or ownership.
-
-## 7. Credential retry and core MPP validation
-
-The MPP-aware client retries the original HTTP request with the serialized
-Credential. Before invoking TRON verification, `mppx` validates the Credential
-shape and authenticated Challenge binding.
-
-`src/server/Charge.ts` validates the payload and verifies the payer signature
-against the original Challenge before calling a payment verifier or claiming
-the transaction. Invalid and unsigned proofs are rejected. It also checks that
-the Credential source, when present, equals the source
-derived from its payload payer and the requested network. It passes only the
-transaction payload and the original Challenge request to the configured
-`ChargeVerifier`.
-
-## 8. TronWeb on-chain verification
-
-`createTronWebVerifier()` queries the TRON node concurrently for:
-
-- the transaction (`getTransaction`); and
-- transaction information/receipt (`getTransactionInfo`).
-
-Both adapters require a configured `network` matching the network served by
-their node. Requests for other networks are rejected before wallet or node
-operations. The verifier then performs the following checks.
-
-### Transaction execution status
-
-The verifier rejects every explicit failure from either
-`transactionInfo.receipt.result` or `transaction.ret[0].contractRet`. One success
-field cannot override a failure in the other. With normal settings, transaction
-info and a `SUCCESS` status are required.
-
-`allowUnconfirmed: true` permits a missing receipt for pending native transfers,
-but never overrides an explicit failure or swallows an RPC exception. A
-positive `minConfirmations` still requires confirmed block information.
-
-`transactionInfo.contractResult` is not a status. It contains contract return
-data and may be `[""]` for a successful native transfer.
-
-### Confirmations
-
-When `minConfirmations` is greater than zero, the verifier requires:
-
-- a transaction `blockNumber`;
-- `tronWeb.trx.getCurrentBlock()` support; and
-- `currentBlock - transactionBlock + 1 >= minConfirmations`.
-
-### Native TRX verification
-
-The first transaction contract must be `TransferContract`. The verifier reads:
-
-- `amount`;
-- `to_address`; and
-- `owner_address`.
-
-It converts hex addresses to base58 and requires exact matches for atomic amount
-and recipient. The owner becomes the verified payer.
-
-### TRC-20 verification
-
-The first transaction contract must be `TriggerSmartContract`, and its contract
-address must match the requested TRC-20 contract. The verifier then locates the
-standard ERC-20/TRC-20 `Transfer(address,address,uint256)` event in the receipt
-logs and validates:
-
-- emitting token contract;
-- recipient topic; and
-- atomic transfer amount.
-
-The event's `from` topic becomes the verified payer. Log contract addresses are
-decoded by length: 20-byte addresses receive the `41` prefix, while 21-byte
-TRON addresses retain it, including contracts whose 20-byte address begins
-with `41`.
-
-### Payer and reference binding
-
-The TronWeb adapter requires the on-chain payer to equal the Credential payer.
-The server wrapper additionally requires:
-
-- verifier `reference === payload.txId`; and
-- verifier `payer === payload.payer`.
-
-This prevents a custom verifier from accidentally returning results for a
-different transaction or payer.
-
-## 9. Replay protection
-
-After all verification succeeds, the server uses two atomic store operations:
-
-```text
-tron:challenge:<challenge-id>
-tron:charge:<network>:<lowercase-transaction-id>
-```
-
-First it reserves the challenge ID with a unique reservation token. It then
-claims the transaction ID with its consumption timestamp. Each operation uses
-MPP's `Store.AtomicStore.update()` to write only if the key is absent. Both
-markers remain after successful acceptance, preventing either a second payment
-for the same challenge or the same payment for a different challenge.
-
-If the transaction was already consumed or its store update throws, the server
-atomically releases its own challenge reservation before returning the failure.
-This lets an unused valid payment retry the challenge. The conditional release
-cannot delete another request's reservation. A failure or process exit that
-leaves a reservation behind rejects further use of that challenge; a fresh
-challenge can be issued. No success is returned until both claims succeed.
-
-Atomic read-modify-write is essential. A separate `get()` followed by `put()`
-would allow two concurrent requests to accept the same challenge or transaction.
-The existing transaction key format is retained, preserving persisted replay
-history from earlier versions.
-
-If no store is supplied, the SDK creates `Store.memory()`. That is appropriate
-for tests and a single long-running process, but it is cleared on restart and is
-not shared between independently configured server instances. Production apps
-must inject one shared persistent atomic store across all instances that accept
-the same payments.
-
-Reusing an accepted challenge or transaction produces `VerificationFailedError`
-with the corresponding reason:
-
-```text
-TRON challenge has already been used
-TRON transaction has already been used
-```
-
-The HTTP transport converts the verification failure into a 402 Problem Details
-response and may include a fresh Challenge so the client can make a new payment.
-
-## 10. Receipt and protected response
-
-After the atomic claim, the server method returns an MPP `Receipt`:
-
-```json
-{
-  "method": "tron",
-  "reference": "<transaction-id>",
-  "status": "success",
-  "timestamp": "<TRON block timestamp>"
-}
-```
-
-The reference is the verified TRON transaction ID. When TronWeb supplies a block
-timestamp, the SDK uses it; otherwise it uses the server's current time.
-
-For Fetch API integrations, the application calls:
-
-```ts
-return result.withReceipt(Response.json({ data: '...' }))
-```
-
-For Node's native HTTP API, `Mppx.toNodeListener()` writes a 402 Challenge when
-payment is absent or invalid. On success it attaches the serialized Receipt to
-the `Payment-Receipt` header, and the application writes the protected body.
-
-The payer-side `mppx.fetch()` returns only the final response to application
-code. A successful end-to-end call therefore has HTTP 200, protected content,
-and an optional auditable `Payment-Receipt` header.
-
-## Why a failed verification can cause another payment
-
-An MPP client interprets a 402 response as a request for payment. If a server
-rejects a transaction and responds with another valid Challenge, an automatic
-client may pay again up to its retry limit. This is why server verification must
-be correct and why client `maxAmount`, network, and currency policies matter.
-
-The end-to-end app waits for confirmation before retrying so a correctly
-configured `minConfirmations: 1` server does not reject a transaction merely
-because its receipt is not visible yet.
-
-## Error categories
-
-Common failures include:
-
-| Stage | Example |
-| --- | --- |
-| Schema validation | Invalid address, transaction ID, or atomic amount |
-| Client policy | Disallowed network/currency or amount over limit |
-| Wallet | Missing payer, rejected signature, insufficient balance/resources |
-| Status | Failed, reverted, or unavailable transaction result |
-| Confirmation | Transaction not included or too few confirmations |
-| Native transfer | Wrong contract type, amount, or recipient |
-| TRC-20 transfer | Wrong token contract or missing/mismatched Transfer event |
-| Identity binding | Credential source or payer mismatch |
-| Reference binding | Verifier returned a different transaction ID |
-| Replay | Network/transaction ID was already claimed |
-
-No Receipt is issued for any failure.
-
-## Source map
-
-| File | Role in the flow |
-| --- | --- |
-| `src/Types.ts` | Constants, validation schemas, normalized request and signer/verifier contracts |
-| `src/Methods.ts` | Shared `tron/charge` definition and display-to-atomic transform |
-| `src/client/Charge.ts` | Client policy, signer invocation, source construction, and Credential serialization |
-| `src/client/index.ts` | Client exports and `tron` namespace |
-| `src/server/Charge.ts` | Defaults, stable binding, verifier orchestration, replay claim, and Receipt creation |
-| `src/server/index.ts` | Server exports plus `Mppx`, `Expires`, and `Store` re-exports |
-| `src/tronweb/index.ts` | TronWeb signer, chain verifier, confirmation logic, and TRX/TRC-20 parsing |
-| `src/index.ts` | Shared schemas and method exports |
-| `test/sdk.test.ts` | Deterministic unit coverage with fake signers, verifiers, and TRON node data |
-
-## Current scope and production considerations
-
-The current implementation supports one-time `charge` payments. It does not yet
-implement MPP sessions or subscriptions.
-
-Before production deployment:
-
-1. Use a shared persistent atomic replay store.
-2. Keep `MPP_SECRET_KEY` stable, secret, server-only, and managed through a
-   secret manager.
-3. Keep payer keys client-only and out of source control.
-4. Use explicit network and currency allowlists plus a client maximum amount.
-5. Require an appropriate number of confirmations for the risk level.
-6. Use reliable authenticated TRON node infrastructure.
-7. Test both successful and adversarial flows on Nile before mainnet.
-8. Monitor Challenge creation, payment success, verification failures, and
-   transaction references without logging private keys or bearer credentials.
-9. Ensure automatic retries cannot exceed the application's intended spending
-   policy.
-
-## End-to-end test application
-
-The companion app at `../tron-mpp-sdk-app-test` demonstrates the complete native
-TRX path:
-
-- `src/server.ts`: Node paid endpoint and TronWeb verifier;
-- `src/payment-client.ts`: client method and confirmation-aware signer;
-- `src/client.ts`: automatic 402/payment/retry flow; and
-- `src/replay.ts`: one accepted Credential followed by an intentional replay.
-
-Its successful output proves integration of the public SDK entry points, a real
-Nile transaction, MPP Credential retry, on-chain verification, replay claiming,
-Receipt transport, and protected-resource delivery.
+| `src/protocol/Charge.ts` | Charge schema, method definition, witnesses and credential validation |
+| `src/protocol/Session.ts` | Session schema, method definition and funding authorization validation |
+| `src/protocol/Primitives.ts` | Shared address, integer and signature validation; channel IDs and typed data |
+| `src/protocol/Errors.ts` | Shared transaction and session Problem Details errors |
+| `src/client/Charge.ts` | Client charge policy, negotiation and credential creation |
+| `src/client/Session.ts` | Client session policy and voucher helper |
+| `src/server/Charge.ts` | Charge orchestration, replay reservations and receipts |
+| `src/server/Session.ts` | Channel verification, durable accounting, consumption and settlement |
+| `src/server/SessionStore.ts` | Versioned session persistence, monotonic observations, request deduplication and pruning |
+| `src/server/Challenges.ts` | Persistence and exact comparison of issued HTTP challenges |
+| `src/tronweb/Transport.ts` | TronWeb calls, signatures, broadcasts and receipt confirmation |
+| `src/tronweb/Token.ts` | Token/Permit2 ABIs and ordered TRC-20 transfer-event verification |
+| `src/tronweb/Charge.ts` | Charge settlement adapter |
+| `src/tronweb/Session.ts` | Escrow adapter, wallet funding and settlement relayer |
+| `normalizeAddress` / `toBase58Address` | Convert address representations without changing the account |
+| `formatSource` / `parseSource` | Format or validate a chain-scoped payer identity |
+| `createChargeAdapter` / `createSessionAdapter` | Connect the corresponding intent to a TRON node |
+| [`TronPaymentChannel.sol`](../../tron-mpp-sdk-contract/contracts/TronPaymentChannel.sol) in the separate `tron-mpp-sdk-contract` repository | On-chain escrow, voucher enforcement and refunds |
+
+There is one implementation for each intent. Client and server entry points expose
+`tron.charge` and `tron.session`; the package root exposes their protocol namespaces
+and shared primitives. Native-transfer branches and alternate charge factories are
+absent.
+
+The exact signing-domain name `EVM Payment Channel` remains in typed data and the
+escrow because the session specification requires it. Renaming that value would
+change every voucher and payee-authorization digest. Compiler configuration and
+specification URLs likewise retain their standard names.

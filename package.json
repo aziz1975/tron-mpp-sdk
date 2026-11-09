@@ -1,12 +1,13 @@
 {
   "name": "tron-mpp-sdk",
   "version": "0.1.0",
-  "description": "MPP payment method SDK for TRON charge payments.",
+  "description": "MPP payment SDK for TRON TRC-20 charges and escrow sessions.",
   "type": "module",
   "sideEffects": false,
   "files": [
     "dist",
     "src",
+    "docs",
     "README.md",
     "LICENSE"
   ],

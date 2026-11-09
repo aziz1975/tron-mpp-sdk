@@ -1,4 +1,1 @@
-export * as Methods from './Methods.js'
-export * as Types from './Types.js'
-export { charge } from './Methods.js'
-export { paymentProofMessage, verifyPaymentProof } from './Proof.js'
+export * from './protocol/index.js'

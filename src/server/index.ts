@@ -1,14 +1,10 @@
-import { charge as charge_ } from './Charge.js'
+import { charge } from './Charge.js'
+import { session } from './Session.js'
 
 export { Expires, Mppx, Store } from 'mppx/server'
-export { charge } from './Charge.js'
-export type { ChargeVerifier, VerifiedPayment } from '../Types.js'
+export type { ChargeParameters, ChargeMethod } from './Charge.js'
+export { SessionManager, needVoucherEvent, receiptEvent } from './Session.js'
+export type { SessionParameters, SessionState } from './Session.js'
 
-export function tron(parameters: tron.Parameters): ReturnType<typeof charge_> {
-  return tron.charge(parameters)
-}
-
-export namespace tron {
-  export type Parameters = charge_.Parameters
-  export const charge = charge_
-}
+/** TRC-20 payment methods: one-time charges and escrow-backed sessions. */
+export const tron = { charge, session } as const
