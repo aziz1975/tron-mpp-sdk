@@ -55,15 +55,26 @@ export function session(parameters: SessionParameters) {
         if (plan.action === 'voucher' && deposit - BigInt(current.settled) < BigInt(request.amount)) throw new Error('Channel balance does not cover one service unit.')
       }
       S.assertClientPolicy(plan, policy)
+      if (typeof wallet.signRequest !== 'function') throw new Error('Session wallet must support request signing.')
       const payload = S.PayloadSchema.parse(await wallet.createPayload(request, plan, policy))
       if ('type' in payload && !(request.methodDetails.credentialTypes ?? ['hash']).includes(payload.type)) throw new Error('Session credential type not advertised.')
       if ('cumulativeAmount' in payload && BigInt(payload.cumulativeAmount) > BigInt(P.Uint128Schema.parse(parameters.maxCumulativeAmount))) throw new Error('Voucher exceeds client cumulative limit.')
       if (request.methodDetails.channelId && payload.channelId !== request.methodDetails.channelId) throw new Error('Resume channel mismatch.')
       if (payload.action !== plan.action || ('channelId' in plan && payload.channelId !== plan.channelId) ||
           ('cumulativeAmount' in plan && (!('cumulativeAmount' in payload) || payload.cumulativeAmount !== plan.cumulativeAmount))) throw new Error('Wallet did not execute the approved payment plan.')
-      return Credential.serialize(Credential.from({ challenge, payload, source: P.formatSource(parameters.payer, request.methodDetails.chainId) }))
+      S.assertClientPolicy(plan, policy)
+      const authorized = await authorizeSessionRequest({ ...challenge, request }, payload, data => wallet.signRequest(data, payload.action))
+      S.assertClientPolicy(plan, policy)
+      return Credential.serialize(Credential.from({ challenge, payload: authorized, source: P.formatSource(parameters.payer, request.methodDetails.chainId) }))
     },
   })
+}
+
+/** Authenticate a manually prepared payload without changing its settlement signature. */
+export async function authorizeSessionRequest(challenge: S.Challenge, payload: S.Payload, signTypedData: P.TypedSigner): Promise<S.Payload> {
+  const nonce = `0x${Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('')}` as Hex
+  const signature = await signTypedData(S.requestAuthorizationTypedData(challenge, payload, nonce))
+  return S.PayloadSchema.parse({ ...payload, requestAuthorization: { nonce, signature } })
 }
 
 export async function signVoucher(parameters: {

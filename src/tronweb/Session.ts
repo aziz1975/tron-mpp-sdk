@@ -191,6 +191,11 @@ export function createSessionWallet(transport: TronTransport, escrowContract: st
   return {
     adapter,
     payer: transport.payer,
+    async signRequest(data: P.TypedData, action: S.Payload['action']) {
+      const sign = action === 'topUp' ? transport.signTypedData : options.voucherSigner ?? transport.signTypedData
+      if (!sign) throw new InvalidRequestError('Wallet request signing required.')
+      return sign(data)
+    },
     open: (request: S.Request, deposit: string, initialAmount: string, authorizedSigner = P.zeroAddress) => open(request, deposit, initialAmount, authorizedSigner),
     topUp: (request: S.Request, channelId: Hex, additionalDeposit: string) => topUp(request, channelId, additionalDeposit),
     async createPayload(requestInput: S.Request, planInput: S.PaymentPlan, policy: S.ClientPolicy): Promise<S.Payload> {

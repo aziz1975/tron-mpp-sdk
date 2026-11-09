@@ -104,6 +104,21 @@ export function voucherTypedData(p: {
     message: { channelId: Bytes32Schema.parse(p.channelId), cumulativeAmount: BigInt(Uint128Schema.parse(p.cumulativeAmount)) },
   }
 }
+/** Off-chain HTTP authentication; never submitted as a settlement voucher. */
+export function sessionRequestTypedData(p: {
+  chainId: number; escrowContract: string; channelId: Hex; challengeHash: Hex; payloadHash: Hex; nonce: Hex
+}): TypedData {
+  return {
+    domain: channelDomain(p.chainId, p.escrowContract),
+    types: { SessionRequest: [
+      { name: 'challengeHash', type: 'bytes32' }, { name: 'channelId', type: 'bytes32' },
+      { name: 'payloadHash', type: 'bytes32' }, { name: 'nonce', type: 'bytes32' },
+    ] },
+    primaryType: 'SessionRequest',
+    message: { challengeHash: Bytes32Schema.parse(p.challengeHash), channelId: Bytes32Schema.parse(p.channelId),
+      payloadHash: Bytes32Schema.parse(p.payloadHash), nonce: Bytes32Schema.parse(p.nonce) },
+  }
+}
 export function payeeAuthorizationTypedData(p: {
   action: 'settle' | 'close'; chainId: number; escrowContract: string; channelId: Hex;
   cumulativeAmount: string; nonce: string; deadline: string

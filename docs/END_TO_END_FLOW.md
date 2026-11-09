@@ -51,14 +51,22 @@ See [protocol integration](PROTOCOL.md) for configuration examples.
    signs or broadcasts. Management top-ups may replenish an exhausted channel.
 3. The server confirms that funding affected the exact escrow/channel and verifies
    the initial voucher and channel state. Sponsored deposits bind channel terms
-   through Permit2 witnesses or deterministic authorization nonces.
+   through Permit2 witnesses or deterministic authorization nonces. Before
+   sponsoring a transaction, it validates the intended channel, voucher, amounts,
+   and HTTP request proof.
 4. The client submits cumulative vouchers. The server verifies signatures before
    stale-voucher idempotency, checks uint128/deposit limits and minimum increments,
-   and persists the highest accepted amount.
+   and persists the highest accepted amount. Each HTTP payload also includes a
+   separate off-chain signature over its challenge, payload and request nonce;
+   signatures published during settlement cannot authenticate HTTP requests.
 5. Service consumption atomically advances `spent` before delivery. Request keys
    prevent duplicate charging through separate durable records and a write-ahead
    marker. The channel record stays constant in size. Available credit is
    `min(acceptedCumulative, deposit) - spent`.
+   HTTP service credentials consume their signed nonce once; replay attempts
+   cannot run another paid handler. A client-supplied `Idempotency-Key` does not
+   suppress billing for a fresh signed request. Applications own business-response
+   caching when they need idempotent retries.
 6. The payee settles a persisted voucher or cooperatively closes the channel. The
    payer can request forced close and recover uncommitted funds after the grace
    period, during which the payee may still settle. Finalized records stay on-chain

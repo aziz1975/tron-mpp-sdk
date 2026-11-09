@@ -5,7 +5,7 @@ import type { TronWeb } from 'tronweb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as P from '../src/index.js'
 import * as S from '../src/protocol/Session.js'
-import { session as clientSession } from '../src/client/Session.js'
+import { session as clientSession, authorizeSessionRequest } from '../src/client/Session.js'
 import { SessionManager, needVoucherEvent, session as serverSession } from '../src/server/Session.js'
 import { Mppx } from '../src/server/index.js'
 import { Mppx as ClientMppx } from '../src/client/index.js'
@@ -223,14 +223,14 @@ describe('session client policy before wallet execution', () => {
     wallet.adapter.verifyTransaction = vi.fn(async () => {})
     const header = await client(f, wallet, { action: 'open', type: 'hash', deposit: '200', cumulativeAmount: '100' }).createCredential({ challenge: f.challenge() })
     expect(Credential.deserialize(header).payload).toMatchObject({ action: 'open', cumulativeAmount: '100' })
-    expect(t.signTypedData).toHaveBeenCalledTimes(1); expect(t.send).toHaveBeenCalledTimes(2)
+    expect(t.signTypedData).toHaveBeenCalledTimes(2); expect(t.send).toHaveBeenCalledTimes(2)
   })
   it.each(['permit2', 'authorization'] as const)('signs a prepared %s opening without broadcasting on the client', async type => {
     const f = fixture(), signed = await funding(f, type), t = transport(), wallet = createSessionWallet(t, escrow, { authorizationDomain: domain })
     const plan = S.PaymentPlanSchema.parse({ ...signed, channelId: id, cumulativeAmount: '100' })
     const header = await client(f, wallet, plan).createCredential({ challenge: f.challenge() })
     expect(Credential.deserialize(header).payload).toMatchObject({ action: 'open', type, channelId: id })
-    expect(t.signTypedData).toHaveBeenCalledTimes(2); expect(t.send).not.toHaveBeenCalled()
+    expect(t.signTypedData).toHaveBeenCalledTimes(3); expect(t.send).not.toHaveBeenCalled()
   })
   it('allows an authorized third party to prepare a sponsored top-up', async () => {
     const f = fixture(), t = transport()
@@ -245,7 +245,7 @@ describe('session client policy before wallet execution', () => {
       maxUnitAmount: '1', maxCumulativeAmount: '100', wallet, preparePayment: async () => plan })
     const header = await method.createCredential({ challenge: f.challenge() })
     expect(Credential.deserialize(header)).toMatchObject({ source: P.formatSource(other.address, chainId), payload: { action: 'topUp', type: 'permit2' } })
-    expect(t.signTypedData).toHaveBeenCalledTimes(1); expect(t.send).not.toHaveBeenCalled()
+    expect(t.signTypedData).toHaveBeenCalledTimes(2); expect(t.send).not.toHaveBeenCalled()
   })
   it('runs the automatic HTTP session flow with an unsigned plan and a real wallet signature', async () => {
     const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
@@ -260,7 +260,7 @@ describe('session client policy before wallet execution', () => {
     const response = await http.fetch('https://api.test/session')
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({ paid: true })
-    expect(t.signTypedData).toHaveBeenCalledTimes(1); expect(t.send).toHaveBeenCalledTimes(2)
+    expect(t.signTypedData).toHaveBeenCalledTimes(2); expect(t.send).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -307,7 +307,7 @@ describe('session simulation error mapping', () => {
     const initial = await route(new Request('https://api.test/session'))
     if (initial.status !== 402) throw new Error('Expected challenge')
     const challenge = Challenge.fromResponse(initial.challenge)
-    const payload = { ...await f.voucher('105'), action: 'close' }
+    const payload = await authorizeSessionRequest({ ...challenge, request: S.RequestSchema.parse(challenge.request) }, { ...await f.voucher('105'), action: 'close' }, sign)
     const credential = Credential.serialize(Credential.from({ challenge, payload, source }))
     const result = await route(new Request('https://api.test/session', { headers: { Authorization: credential } }))
     if (result.status !== 402) throw new Error('Expected rejection')

@@ -81,7 +81,20 @@ export class SessionManager {
     return paymentBoundary(() => this.acceptValidated(parseInput(S.RequestSchema, requestInput, 'session request'),
       parseInput(S.PayloadSchema, payloadInput, 'session payload'), source))
   }
-  private async acceptValidated(request: S.Request, payload: S.Payload, source?: string): Promise<SessionState> {
+  /** HTTP callers must also verify challenge issuance and route binding. */
+  acceptRequest(challenge: S.Challenge, payloadInput: S.Payload, source?: string): Promise<SessionState> {
+    return paymentBoundary(() => this.acceptValidated(parseInput(S.RequestSchema, challenge.request, 'session request'),
+      parseInput(S.PayloadSchema, payloadInput, 'session payload'), source, challenge))
+  }
+  private async verifyVoucher(request: S.Request, payload: S.Payload, channel: S.Channel, deposit = channel.deposit): Promise<void> {
+    if (payload.action === 'topUp') return
+    const signature = payload.action === 'open' && payload.type !== 'hash' ? payload.voucherSignature : payload.signature
+    const signer = P.isSameAddress(channel.authorizedSigner, P.zeroAddress) ? channel.payer : channel.authorizedSigner
+    if (!await P.verifySigner(P.voucherTypedData({ ...request.methodDetails, channelId: payload.channelId, cumulativeAmount: payload.cumulativeAmount }),
+      signature, signer, this.parameters.adapter.contractSignature)) fail('invalid-signature', 402, 'Voucher signature invalid.')
+    if (BigInt(payload.cumulativeAmount) > BigInt(deposit)) fail('amount-exceeds-deposit', 402, 'Voucher exceeds deposit.')
+  }
+  private async acceptValidated(request: S.Request, payload: S.Payload, source?: string, challenge?: S.Challenge): Promise<SessionState> {
     const id = payload.channelId
     this.assertRequest(request, id)
     await this.assertGrace()
@@ -90,16 +103,49 @@ export class SessionManager {
     if (payload.action === 'voucher') funding = payload.deposit
     if ('type' in payload && !(request.methodDetails.credentialTypes ?? ['hash']).includes(payload.type)) throw new InvalidRequestError('Credential format not advertised.')
     if (funding) {
-      if (payload.action === 'voucher' && funding.action === 'topUp') await this.channel(request, id)
       if (!(this.parameters.credentialTypes ?? ['hash']).includes(funding.type)) throw new InvalidRequestError('Funding capability not configured.')
       if (funding.type === 'permit2' && (!this.parameters.permit2Contract || !request.methodDetails.permit2Contract ||
           !P.isSameAddress(request.methodDetails.permit2Contract, this.parameters.permit2Contract))) throw new InvalidRequestError('Untrusted Permit2 contract.')
       if (!this.parameters.adapter.fund) throw new InvalidRequestError('Adapter has no sponsored funding support.')
       if (source && !P.isSameAddress(this.source(source, request.methodDetails.chainId), funding.authorization.from)) fail('signer-mismatch', 402, 'Funding source mismatch.')
-      const amount = 'value' in funding.authorization ? funding.authorization.value : funding.authorization.permitted.amount
-      if (payload.action === 'topUp' && payload.additionalDeposit !== amount) throw new InvalidRequestError('TopUp amount mismatch.')
-      await this.fund(request, id, funding, amount)
     }
+    const amount = funding ? ('value' in funding.authorization ? funding.authorization.value : funding.authorization.permitted.amount) : undefined
+    if (payload.action === 'topUp' && funding && payload.additionalDeposit !== amount) throw new InvalidRequestError('TopUp amount mismatch.')
+    // Check the intended channel, voucher and accounting before spending relayer fees.
+    // A sponsored open supplies all participant/signer terms before the channel exists.
+    const before: S.Channel = funding?.action === 'open'
+      ? { payer: funding.authorization.from, payee: request.recipient, token: request.currency, authorizedSigner: funding.authorizedSigner ?? P.zeroAddress,
+        deposit: amount!, settled: '0', closeRequestedAt: '0', finalized: false }
+      : await this.channel(request, id, payload.action === 'close')
+    const proposedDeposit = BigInt(before.deposit) + (funding?.action === 'topUp' ? BigInt(amount!) : 0n)
+    if (proposedDeposit >= 1n << 128n) throw new InvalidRequestError('Deposit exceeds uint128.')
+    if (source && funding?.action !== 'topUp' && !P.isSameAddress(this.source(source, request.methodDetails.chainId), before.payer)) fail('signer-mismatch', 402, 'Session source mismatch.')
+    const previous = await this.state(id)
+    if (previous) {
+      live(previous)
+      if (previous.binding !== this.binding(request)) throw new InvalidRequestError('Session terms changed.')
+    }
+    if (payload.action !== 'open' && !previous && funding?.action !== 'open') fail('channel-not-found', 410, 'Session accounting not initialized.')
+    await this.verifyVoucher(request, payload, before, proposedDeposit.toString())
+    if (payload.action === 'open' && proposedDeposit - BigInt(before.settled) < BigInt(request.amount)) fail('insufficient-balance', 402, 'Deposit does not cover one unit.')
+    if (payload.action !== 'topUp') {
+      const accepted = BigInt(previous?.acceptedCumulative ?? before.settled)
+      const spent = BigInt(previous?.spent ?? before.settled)
+      const cumulative = BigInt(payload.cumulativeAmount)
+      if (payload.action === 'close' && cumulative < spent) fail('insufficient-balance', 402, 'Close voucher does not cover delivered service.')
+      if (payload.action !== 'close' && cumulative > accepted && cumulative - accepted < BigInt(request.methodDetails.minVoucherDelta ?? '0')) fail('delta-too-small', 402, 'Voucher increment below minimum.')
+      if (challenge && this.parameters.chargeOnVerify !== false && payload.action !== 'close' &&
+          (cumulative > accepted ? cumulative : accepted) - spent < BigInt(request.amount)) fail('insufficient-balance', 402, 'Voucher does not cover one service unit.')
+    }
+    if (challenge) {
+      const proof = payload.requestAuthorization
+      if (!proof) fail('invalid-request-authorization', 402, 'A signed session request is required.')
+      const signer = payload.action === 'topUp' ? funding?.authorization.from ?? before.payer
+        : P.isSameAddress(before.authorizedSigner, P.zeroAddress) ? before.payer : before.authorizedSigner
+      if (!await P.verifySigner(S.requestAuthorizationTypedData(challenge, payload, proof.nonce), proof.signature, signer,
+        this.parameters.adapter.contractSignature)) fail('invalid-request-authorization', 402, 'Session request signature invalid.')
+    }
+    if (funding) await this.fund(request, id, funding, amount!)
     if ('type' in payload && payload.type === 'hash') {
       this.source(source, request.methodDetails.chainId)
       if (!(this.parameters.credentialTypes ?? ['hash']).includes('hash')) throw new InvalidRequestError('Hash funding not configured.')
@@ -114,8 +160,6 @@ export class SessionManager {
       if (expected !== id || !P.isSameAddress(channel.authorizedSigner, payload.authorizedSigner ?? P.zeroAddress)) throw new InvalidRequestError('Open channel identity mismatch.')
       if (BigInt(channel.deposit) - BigInt(channel.settled) < BigInt(request.amount)) fail('insufficient-balance', 402, 'Deposit does not cover one unit.')
     }
-    const previous = await this.state(id)
-    if (payload.action !== 'open' && !previous && funding?.action !== 'open') fail('channel-not-found', 410, 'Session accounting not initialized.')
     if (payload.action === 'topUp') {
       // Receipt verification binds the exact event amount. Other calls may already
       // have observed this deposit, or additional deposits in a later snapshot.
@@ -129,10 +173,7 @@ export class SessionManager {
     }
     const signature = payload.action === 'open' && payload.type !== 'hash' ? payload.voucherSignature : payload.signature
     const cumulativeAmount = payload.cumulativeAmount
-    const signer = P.isSameAddress(channel.authorizedSigner, P.zeroAddress) ? channel.payer : channel.authorizedSigner
-    const typed = P.voucherTypedData({ ...request.methodDetails, channelId: id, cumulativeAmount })
-    if (!await P.verifySigner(typed, signature, signer, this.parameters.adapter.contractSignature)) fail('invalid-signature', 402, 'Voucher signature invalid.')
-    if (BigInt(cumulativeAmount) > BigInt(channel.deposit)) fail('amount-exceeds-deposit', 402, 'Voucher exceeds deposit.')
+    await this.verifyVoucher(request, payload, channel)
     const binding = this.binding(request)
     const state = await this.records.update(id, current => {
       if (current) live(current)
@@ -215,7 +256,7 @@ export class SessionManager {
     })
   }
 
-  consume(requestInput: S.Request, channelId: Hex, units = 1, idempotencyKey?: string): Promise<SessionState> {
+  consume(requestInput: S.Request, channelId: Hex, units = 1, idempotencyKey?: string, options: { rejectReplay?: boolean } = {}): Promise<SessionState> {
     return paymentBoundary(async () => {
       const request = parseInput(S.RequestSchema, requestInput, 'session request')
       const id = parseInput(P.Bytes32Schema, channelId, 'channel ID')
@@ -223,7 +264,7 @@ export class SessionManager {
       const channel = await this.channel(request, id)
       const cost = BigInt(request.amount) * BigInt(units)
       if (cost >= 1n << 128n) throw new InvalidRequestError('Service cost exceeds uint128.')
-      return this.records.consume(id, this.binding(request), cost, channel.deposit, idempotencyKey)
+      return this.records.consume(id, this.binding(request), cost, channel.deposit, idempotencyKey, options.rejectReplay)
     })
   }
   private async reserve(id: Hex, kind: SessionOperation['kind'], amount?: string, signature?: Hex): Promise<SessionOperation> {
@@ -327,9 +368,9 @@ export function session(parameters: SessionParameters): Method.Server<typeof S.m
       if (envelope) await assertIssuedChallenge(parameters.store, credential.challenge)
       const request = parseInput(S.RequestSchema, credential.challenge.request, 'session request')
       const payload = parseInput(S.PayloadSchema, credential.payload, 'session payload')
-      let state = await manager.accept(request, payload, credential.source)
+      let state = await manager.acceptRequest({ ...credential.challenge, request }, payload, credential.source)
       if (parameters.chargeOnVerify !== false && (payload.action === 'open' || payload.action === 'voucher')) state = await manager.consume(request, payload.channelId, 1,
-        envelope?.capturedRequest.headers.get('Idempotency-Key') ? `${credential.challenge.id}:${envelope.capturedRequest.headers.get('Idempotency-Key')}` : undefined)
+        `http:${payload.requestAuthorization!.nonce}`, { rejectReplay: true })
       return Receipt.from({ method: 'tron', intent: 'session', status: 'success', reference: payload.channelId,
         timestamp: new Date().toISOString(), challengeId: credential.challenge.id, channelId: payload.channelId,
         acceptedCumulative: state.acceptedCumulative, spent: state.spent, chainId: request.methodDetails.chainId,

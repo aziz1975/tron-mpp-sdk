@@ -100,8 +100,13 @@ release the operation for retry.
 
 Session clients supply a `wallet` plus `preparePayment`, which returns an unsigned
 payment plan. The SDK checks the cumulative spending limit and existing channel
-balance before wallet signing or funding. Sponsored funding can be reconciled
-after authorization expiry using the saved exact authorization and transaction
+balance before wallet signing or funding. HTTP credentials include a separate
+signed request proof; public settlement vouchers alone cannot authorize service.
+The built-in wallet signs this proof automatically. Custom wallets must implement
+`signRequest`. Each service request nonce is consumed once; replayed credentials
+are rejected, and an `Idempotency-Key` header does not bypass billing.
+Sponsored funding can be reconciled after authorization expiry using the saved
+exact authorization and transaction
 hash. The migration guide covers the updated client and streaming event APIs.
 
 Request idempotency records are stored separately, capped by

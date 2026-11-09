@@ -27,6 +27,7 @@ Ethereum RLP transactions and ERC-4337 entry points are not implemented.
 | Session sponsored deposits | Permit2 witness or token-native `receiveWithAuthorization(bytes signature)` |
 | Session relayed settle/close | Separate typed payee authorization plus voucher, shared nonce used-set |
 | Delegation and contract wallets | `authorizedSigner`; canonical EOA signatures; ERC-1271 verification for vouchers and Permit2 |
+| HTTP session authentication | Separate `SessionRequest` typed proof bound to the challenge, payload and a unique request nonce |
 | Durable accounting | Atomic `Store.update`; accepted cumulative amount, spent and settled totals; request idempotency keys |
 | Streaming primitives | `manager.consume`, `needVoucherEvent`, `receiptEvent`; application owns the streaming loop |
 | Settlement evidence | Successful mined receipt, configurable confirmation depth, exact token transfers and escrow events |
@@ -174,8 +175,13 @@ without running the protected handler. For a control-only endpoint or a metered
 stream, set `chargeOnVerify: false`; the method returns a management response, and
 the application uses `sessionMethod.manager.consume(request, channelId, units,
 idempotencyKey)` before delivering each paid chunk. Always provide unit count and
-an application-controlled idempotency key consistently. The MPP HTTP integration
-scopes request keys by challenge ID. Helpers `needVoucherEvent` and `receiptEvent`
+an application-controlled idempotency key consistently. The HTTP integration uses
+the signed request nonce as its service-consumption key and rejects duplicate
+credentials before granting another handler execution. The client-supplied
+`Idempotency-Key` header is not used for payment deduplication: fresh signed
+requests are charged separately even when that header is reused. Applications
+requiring business-operation idempotency must cache their results or reject
+duplicates before invoking the paid operation. Helpers `needVoucherEvent` and `receiptEvent`
 format SSE events; the application must stop delivery when authorization is
 insufficient and emit the final receipt. Reuse the initial receipt headers for
 streaming responses.
@@ -198,9 +204,11 @@ Each idempotency key has a separate durable record. The channel record holds onl
 constant-size accounting and a write-ahead marker, so interrupted marker writes
 can be completed before a retry without charging twice. Active records are never
 evicted. `maxIdempotencyRecords` defaults to 10,000 per channel: at the limit, a
-new key returns `request-history-full` (409) before charging; existing keys still
-replay. Set an appropriate limit for your workload or close and open another
-channel. Keep the same key and cost when retrying; a changed cost returns 400.
+new key returns `request-history-full` (409) before charging. Low-level `consume`
+returns the prior accounting state for an existing key; HTTP service requests
+reject an already consumed nonce with `request-replayed` (409). Set an appropriate
+limit for your workload or close and open another channel. Keep the same key and
+cost when retrying low-level accounting calls; a changed cost returns 400.
 
 After closure, `requestRetentionMs` defaults to 24 hours. Call
 `sessionMethod.manager.pruneRequests(channelId, 100)` from your cleanup job to
@@ -245,8 +253,27 @@ sign, approve, or broadcast. The SDK validates the plan and `maxCumulativeAmount
 before calling `wallet.createPayload`. The supplied wallet enforces the same
 policy before signing or funding and rechecks expiry after asynchronous work.
 Custom wallets must implement `Session.Wallet` and execute exactly the approved
-plan. Low-level `wallet.open`, `topUp`, `voucher`, `close`, and `signVoucher` calls
+plan, including `signRequest(data, action)` for HTTP request authentication.
+Low-level `wallet.open`, `topUp`, `voucher`, `close`, and `signVoucher` calls
 remain explicit application operations outside the configured client policy.
+
+HTTP session payloads require `requestAuthorization: { nonce, signature }`.
+The `SessionRequest` typed data uses the escrow's existing domain, with separate
+fields for the canonical challenge hash, channel ID, canonical payload hash and
+a random bytes32 nonce. It cannot be substituted with a `Voucher` signature.
+The proof binds the entire normalized payload, including funding and settlement
+signatures, and the challenge's ID, realm, expiry and normalized request.
+These proofs are kept off-chain. Open/voucher/close requests use the channel's
+voucher signer (the payer or its authorized delegate). Top-ups use the funding
+owner, or the payer for direct hash funding. ERC-1271 request signatures are
+verified through the configured adapter.
+
+`tron.session` creates a fresh proof automatically after wallet execution. For
+manual HTTP credentials, call `authorizeSessionRequest(challenge, payload,
+signTypedData)` from `tron-mpp-sdk/client`, then serialize the returned payload.
+Retries of a service credential that already succeeded are rejected; the SDK
+does not cache protected-handler responses. A new signed nonce authorizes a new
+billable request, subject to the accepted voucher's remaining credit.
 
 For existing channels, the client queries the bound wallet's adapter before
 signing. It verifies the payer, payee, token, active state and available on-chain
@@ -282,12 +309,20 @@ Use a shared persistent atomic store for every server instance. Session state is
 scoped by chain, escrow and channel. Charge replay keys are scoped by numeric chain ID and transaction hash. Session terms
 remain fixed for the lifetime of a local accounting record.
 
+Sponsored funding checks the intended channel, voucher, amount limits and local
+accounting before submission. HTTP request proofs are also verified before
+funding. Known uncertain funding hashes retain their existing reconciliation
+behavior, without rebroadcasting an authorization.
+
 The HTTP transport persists complete issued challenges and compares the
 echoed auth-params before verification, in addition to Mppx's HMAC and route checks.
-Keep these records until challenge expiry. Low-level method hooks and manager
-calls assume the caller already authenticated the challenge; applications should
-normally use the Mppx HTTP integration. Alternative transports need equivalent
-issuance tracking.
+Keep these records until challenge expiry. Low-level `manager.accept` and
+`manager.consume` are trusted application APIs; callers must authenticate session
+ownership and challenge issuance themselves. A declared `source` is not proof
+of ownership. `manager.acceptRequest` additionally verifies the request proof,
+but its caller must still verify challenge HMAC, expiry and route binding.
+Applications should normally use the Mppx HTTP integration. Alternative
+transports need equivalent issuance tracking and request authentication.
 
 The charge/session journals reserve outgoing funding before broadcasting. A
 submission timeout is ambiguous: an on-chain payment may have succeeded. Pending
@@ -365,6 +400,15 @@ retains raw constant-call revert bytes that TronWeb's builder would discard.
 ## Verification
 
 ### Upgrading existing integrations
+
+Upgrade session clients and servers together. HTTP credentials without
+`requestAuthorization` are now rejected, even when their voucher is valid.
+The built-in wallet supplies request signing; custom `Session.Wallet`
+implementations must add `signRequest(data, action)`. Manual HTTP integrations
+must use `authorizeSessionRequest` or construct the equivalent typed proof.
+Preserve session stores and request records during upgrades. HTTP billing no
+longer uses `Idempotency-Key`; a successful service credential cannot be replayed
+to run the handler again. Use application response caching for business retries.
 
 Use `tron.charge` and `tron.session` with a configured adapter. Charge setup takes
 `chainId`, `currency` (the TRC-20 contract) and `recipient`. Amounts are atomic

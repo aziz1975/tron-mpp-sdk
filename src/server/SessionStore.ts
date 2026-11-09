@@ -115,7 +115,7 @@ export class SessionRepository {
     })
   }
 
-  async consume(id: Hex, binding: string, cost: bigint, deposit: string, key?: string): Promise<SessionState> {
+  async consume(id: Hex, binding: string, cost: bigint, deposit: string, key?: string, rejectReplay = false): Promise<SessionState> {
     if (key !== undefined && (key.length === 0 || key.length > 1024)) throw new InvalidRequestError('Idempotency key must contain 1 to 1024 characters.')
     P.Uint128Schema.parse(cost.toString())
     const requestId = key === undefined ? undefined : keccak256(toBytes(key))
@@ -128,6 +128,7 @@ export class SessionRepository {
         const raw = await this.store.get(this.requestKey(id, requestId))
         if (raw !== null) {
           if (RequestRecordSchema.parse(raw).cost !== cost.toString()) throw new InvalidRequestError('Idempotency key reused with different cost.')
+          if (rejectReplay) throw new SessionError('request-replayed', 409, 'This signed request has already been consumed.')
           // Check the channel again; a concurrent close must not grant service.
           return this.update(id, current => {
             if (!current || current.closed || current.closing) throw new SessionError('channel-finalized', 410, 'Channel unavailable.')

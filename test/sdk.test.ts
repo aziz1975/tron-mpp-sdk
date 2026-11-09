@@ -8,6 +8,7 @@ import * as P from '../src/index.js'
 import * as C from '../src/protocol/Charge.js'
 import * as S from '../src/protocol/Session.js'
 import { charge as clientCharge } from '../src/client/Charge.js'
+import { authorizeSessionRequest } from '../src/client/Session.js'
 import { charge as serverCharge } from '../src/server/Charge.js'
 import { SessionManager } from '../src/server/Session.js'
 import { createTronWebTransport, createChargeAdapter, createSessionAdapter, waitForReceipt, type TronTransport } from '../src/tronweb/index.js'
@@ -88,7 +89,7 @@ describe('TRON protocol primitives', () => {
     expect(() => clientTron.charge({ adapter: adapter(), chainIds: [chainId], currencies: [currency], recipients: [recipient], maxAtomicAmount: '100' })).toThrow()
     expect(() => serverTron.session({ adapter: sessionFixture().adapter, currency, recipient, store: Store.memory() })).toThrow()
     expect(() => clientTron.session({ chainIds: [chainId], currencies: [currency], escrowContracts: [escrow], payer: account.address,
-      maxUnitAmount: '1', maxCumulativeAmount: '100', wallet: { adapter: sessionFixture().adapter, createPayload: async () => { throw new Error('Must not be called') } }, preparePayment: async () => { throw new Error('Must not be called') } })).toThrow()
+      maxUnitAmount: '1', maxCumulativeAmount: '100', wallet: { adapter: sessionFixture().adapter, signRequest: async () => { throw new Error('Must not be called') }, createPayload: async () => { throw new Error('Must not be called') } }, preparePayment: async () => { throw new Error('Must not be called') } })).toThrow()
   })
 })
 
@@ -281,7 +282,8 @@ describe('session vouchers and durable accounting', () => {
     const initial = await route(new Request('https://api.test/session'))
     if (initial.status !== 402) throw new Error('Expected challenge')
     const c = Challenge.fromResponse(initial.challenge)
-    const p: S.Payload = { ...await f.voucher('50'), action: 'open', type: 'hash', hash, salt }
+    const p = await authorizeSessionRequest({ ...c, request: S.RequestSchema.parse(c.request) },
+      { ...await f.voucher('50'), action: 'open', type: 'hash', hash, salt }, sign)
     const credential = Credential.serialize(Credential.from({ challenge: c, payload: p, source: P.formatSource(account.address, chainId) }))
     const accepted = await route(new Request('https://api.test/session', { headers: { Authorization: credential, 'Idempotency-Key': 'request-1' } }))
     expect(accepted.status).toBe(200)

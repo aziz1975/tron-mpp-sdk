@@ -1,4 +1,5 @@
-import { Method, z } from 'mppx'
+import { Method, PaymentRequest, z } from 'mppx'
+import { keccak256, toBytes } from 'viem'
 import type { Address, Hex } from 'viem'
 import * as P from './Primitives.js'
 import { InvalidRequestError, SessionError } from './Errors.js'
@@ -55,22 +56,33 @@ export function assertClientPolicy(plan: PaymentPlan | undefined, policy: Client
   if (plan && 'cumulativeAmount' in plan && BigInt(plan.cumulativeAmount) > limit) throw new InvalidRequestError('Voucher exceeds client cumulative limit.')
   if (policy.expires !== undefined && (!Number.isFinite(Date.parse(policy.expires)) || Date.parse(policy.expires) <= Date.now())) throw new InvalidRequestError('Session challenge expired or expiry is invalid.')
 }
-const VoucherFields = { channelId: P.Bytes32Schema, cumulativeAmount: P.Uint128Schema, signature: P.ContractSignatureSchema }
+// Optional for trusted low-level accounting calls; required by the HTTP verifier.
+const RequestAuthorizationFields = { requestAuthorization: z.optional(z.object({ nonce: P.Bytes32Schema, signature: P.ContractSignatureSchema })) }
+const VoucherFields = { ...RequestAuthorizationFields, channelId: P.Bytes32Schema, cumulativeAmount: P.Uint128Schema, signature: P.ContractSignatureSchema }
 export const PayloadSchema = z.union([
   z.object({ ...VoucherFields, action: z.literal('voucher'), deposit: z.optional(FundingSchema) }),
   z.object({ ...VoucherFields, action: z.literal('close') }),
   z.object({ ...VoucherFields, action: z.literal('open'), type: z.literal('hash'), hash: P.Bytes32Schema, salt: P.Bytes32Schema, authorizedSigner: z.optional(P.AddressSchema) }),
-  z.object({ action: z.literal('topUp'), type: z.literal('hash'), channelId: P.Bytes32Schema, hash: P.Bytes32Schema, additionalDeposit: P.Uint128Schema }),
-  z.object({ action: z.literal('open'), type: z.literal('permit2'), channelId: P.Bytes32Schema, authorization: Permit,
+  z.object({ ...RequestAuthorizationFields, action: z.literal('topUp'), type: z.literal('hash'), channelId: P.Bytes32Schema, hash: P.Bytes32Schema, additionalDeposit: P.Uint128Schema }),
+  z.object({ ...RequestAuthorizationFields, action: z.literal('open'), type: z.literal('permit2'), channelId: P.Bytes32Schema, authorization: Permit,
     signature: P.ContractSignatureSchema, voucherSignature: P.ContractSignatureSchema, cumulativeAmount: P.Uint128Schema, salt: P.Bytes32Schema, authorizedSigner: z.optional(P.AddressSchema) }),
-  z.object({ action: z.literal('open'), type: z.literal('authorization'), channelId: P.Bytes32Schema, authorization: Authorization,
+  z.object({ ...RequestAuthorizationFields, action: z.literal('open'), type: z.literal('authorization'), channelId: P.Bytes32Schema, authorization: Authorization,
     signature: P.SignatureSchema, voucherSignature: P.SignatureSchema, cumulativeAmount: P.Uint128Schema, salt: P.Bytes32Schema, authorizedSigner: z.optional(P.AddressSchema) }),
-  z.object({ action: z.literal('topUp'), type: z.literal('permit2'), channelId: P.Bytes32Schema, authorization: Permit,
-    signature: P.SignatureSchema, additionalDeposit: P.Uint128Schema, salt: z.optional(P.Bytes32Schema) }),
-  z.object({ action: z.literal('topUp'), type: z.literal('authorization'), channelId: P.Bytes32Schema, authorization: Authorization,
+  z.object({ ...RequestAuthorizationFields, action: z.literal('topUp'), type: z.literal('permit2'), channelId: P.Bytes32Schema, authorization: Permit,
+    signature: P.ContractSignatureSchema, additionalDeposit: P.Uint128Schema, salt: z.optional(P.Bytes32Schema) }),
+  z.object({ ...RequestAuthorizationFields, action: z.literal('topUp'), type: z.literal('authorization'), channelId: P.Bytes32Schema, authorization: Authorization,
     signature: P.SignatureSchema, additionalDeposit: P.Uint128Schema, salt: P.Bytes32Schema }),
 ])
 export type Payload = z.infer<typeof PayloadSchema>
+export type Challenge = { id: string; realm: string; expires?: string | undefined; request: Request }
+export function requestAuthorizationTypedData(challenge: Challenge, payload: Payload, nonce: Hex): P.TypedData {
+  const { requestAuthorization: _authorization, ...body } = PayloadSchema.parse(payload)
+  const request = RequestSchema.parse(challenge.request)
+  return P.sessionRequestTypedData({ ...request.methodDetails, channelId: body.channelId, nonce,
+    challengeHash: keccak256(toBytes(PaymentRequest.serialize({ id: challenge.id, realm: challenge.realm, expires: challenge.expires ?? '', request }))),
+    payloadHash: keccak256(toBytes(PaymentRequest.serialize(body))),
+  })
+}
 export const method = Method.from({ name: 'tron', intent: 'session', schema: { credential: { payload: PayloadSchema }, request: RequestSchema } })
 export type Channel = {
   payer: Address; payee: Address; token: Address; authorizedSigner: Address;
@@ -95,6 +107,8 @@ export type Adapter = {
 export type Wallet = {
   adapter: Pick<Adapter, 'chainId' | 'escrowContract' | 'channel'>
   payer?: string | undefined
+  /** Sign the off-chain SessionRequest proof using the voucher signer, or funder for top-ups. */
+  signRequest: (data: P.TypedData, action: Payload['action']) => Promise<Hex>
   /** Execute exactly this validated unsigned plan; enforce policy before signing or funding. */
   createPayload: (request: Request, plan: PaymentPlan, policy: ClientPolicy) => Promise<Payload>
 }
