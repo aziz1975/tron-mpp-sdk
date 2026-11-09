@@ -37,15 +37,16 @@ export function parseSource(value: string | undefined, chainId: number): Address
   if (!value?.startsWith(prefix)) throw new Error('Missing or wrong-chain TRON source.')
   return normalizeAddress(value.slice(prefix.length))
 }
-export const AddressSchema = z.pipe(z.string(), z.transform(normalizeAddress))
+export const AddressSchema = z.pipe(z.string().check(z.refine(value => {
+  try { normalizeAddress(value); return true } catch { return false }
+}, { abort: true, message: 'Invalid TRON address.' })), z.transform(normalizeAddress))
 export const TokenAddressSchema = AddressSchema.check(z.refine(value => value !== zeroAddress))
-export const Uint256Schema = z.string().check(z.regex(/^(0|[1-9]\d*)$/), z.refine(v => BigInt(v) < 1n << 256n))
-export const Uint128Schema = Uint256Schema.check(z.refine(v => BigInt(v) < 1n << 128n))
+export const Uint256Schema = z.string().check(z.maxLength(78, { abort: true }), z.regex(/^(0|[1-9]\d*)$/, { abort: true }), z.refine(v => BigInt(v) < 1n << 256n, { abort: true }))
+export const Uint128Schema = Uint256Schema.check(z.refine(v => BigInt(v) < 1n << 128n, { abort: true }))
 export const Bytes32Schema = z.pipe(z.string().check(z.regex(/^0x[0-9a-fA-F]{64}$/)), z.transform(v => v.toLowerCase() as Hex))
-export const SignatureSchema = z.pipe(z.string().check(z.regex(/^0x[0-9a-fA-F]{130}$/)), z.transform(v => {
-  assertSignature(v as Hex)
-  return v.toLowerCase() as Hex
-}))
+export const SignatureSchema = z.pipe(z.string().check(z.refine(value => {
+  try { assertSignature(value as Hex); return true } catch { return false }
+}, { abort: true, message: 'Expected a canonical 65-byte signature.' })), z.transform(v => v.toLowerCase() as Hex))
 /** ERC-1271 wallets may use variable-length signatures. EOA verification still enforces canonical r/s/v. */
 export const ContractSignatureSchema = z.pipe(z.string().check(z.regex(/^0x(?:[0-9a-fA-F]{2})+$/), z.maxLength(32770)), z.transform(v => v.toLowerCase() as Hex))
 export const ChainIdSchema = z.number().check(z.int(), z.minimum(1), z.maximum(Number.MAX_SAFE_INTEGER))

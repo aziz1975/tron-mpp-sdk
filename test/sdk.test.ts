@@ -127,7 +127,7 @@ describe('TRC-20 charge', () => {
     expect((await route(new Request('https://api.test/paid', { headers: { Authorization: credential } }))).status).toBe(402)
     expect(a.verify).not.toHaveBeenCalled()
     c.request.amount = '100'
-    await store.delete(`tron:issued:${c.id}`)
+    await store.delete(`tron:issued:v2:${keccak256(toBytes(c.id)).slice(2, 4)}`)
     const unknown = Credential.serialize(Credential.from({ challenge: c, payload: { type: 'hash', hash }, source: P.formatSource(account.address, chainId) }))
     const rejected = await route(new Request('https://api.test/paid', { headers: { Authorization: unknown } }))
     expect(rejected.status).toBe(402)

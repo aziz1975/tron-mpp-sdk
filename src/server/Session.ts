@@ -16,6 +16,8 @@ export type SessionParameters = {
   credentialTypes?: readonly ('hash' | 'permit2' | 'authorization')[]
   permit2Contract?: string
   store: Store.AtomicStore
+  /** Maximum live challenges per each of 256 storage buckets. Default: 64. */
+  maxIssuedChallengesPerBucket?: number
   chargeOnVerify?: boolean
   /** Maximum retained request IDs per channel. New IDs are rejected at the limit. Default: 10,000. */
   maxIdempotencyRecords?: number
@@ -358,14 +360,14 @@ export function session(parameters: SessionParameters): Method.Server<typeof S.m
   if (formats.includes('permit2') && !parameters.permit2Contract) throw new Error('Configure TRON Permit2 address.')
   if (formats.includes('authorization') && !parameters.authorizationDomain) throw new Error('Configure EIP-3009 token domain.')
   const configured = Method.toServer<typeof S.method, Pick<S.Request, 'currency' | 'recipient' | 'methodDetails'>>(S.method, {
-    transport: challengeTransport(parameters.store),
+    transport: challengeTransport(parameters.store, parameters.maxIssuedChallengesPerBucket),
     defaults: { currency: P.TokenAddressSchema.parse(parameters.currency), recipient: P.normalizeAddress(parameters.recipient),
       methodDetails: { chainId: parameters.adapter.chainId, escrowContract: P.normalizeAddress(parameters.adapter.escrowContract),
         credentialTypes: formats, feePayer: formats.some(f => f !== 'hash'),
         ...(parameters.permit2Contract ? { permit2Contract: P.normalizeAddress(parameters.permit2Contract) } : {}) } },
     stableBinding: request => ({ ...request }),
     async verify({ credential, envelope }) {
-      if (envelope) await assertIssuedChallenge(parameters.store, credential.challenge)
+      if (envelope) await assertIssuedChallenge(parameters.store, credential.challenge, parameters.maxIssuedChallengesPerBucket)
       const request = parseInput(S.RequestSchema, credential.challenge.request, 'session request')
       const payload = parseInput(S.PayloadSchema, credential.payload, 'session payload')
       let state = await manager.acceptRequest({ ...credential.challenge, request }, payload, credential.source)

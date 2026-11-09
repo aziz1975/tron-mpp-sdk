@@ -52,7 +52,8 @@ export function session(parameters: SessionParameters) {
         const deposit = BigInt(current.deposit) + additional
         if (deposit >= 1n << 128n) throw new Error('Deposit exceeds uint128.')
         if ('cumulativeAmount' in plan && BigInt(plan.cumulativeAmount) > deposit) throw new Error('Voucher exceeds the channel deposit.')
-        if (plan.action === 'voucher' && deposit - BigInt(current.settled) < BigInt(request.amount)) throw new Error('Channel balance does not cover one service unit.')
+        // Settled funds can still represent prepaid service. Only the server knows spent credit.
+        if (plan.action === 'voucher' && deposit < BigInt(request.amount)) throw new Error('Channel deposit does not cover one service unit.')
       }
       S.assertClientPolicy(plan, policy)
       if (typeof wallet.signRequest !== 'function') throw new Error('Session wallet must support request signing.')

@@ -14,6 +14,8 @@ export type ChargeParameters = {
   permit2?: { address: string; spender: string }
   authorizationDomain?: P.AuthorizationDomain
   store?: Store.AtomicStore
+  /** Maximum live challenges per each of 256 storage buckets. Default: 64. */
+  maxIssuedChallengesPerBucket?: number
 }
 type Defaults = Pick<C.Request, 'currency' | 'recipient' | 'methodDetails'>
 const JournalSchema = z.object({
@@ -104,13 +106,13 @@ export function charge(parameters: ChargeParameters): ChargeMethod {
   }
   const method = Method.toServer<typeof C.method, Defaults>(C.method, {
     defaults,
-    transport: challengeTransport(store),
+    transport: challengeTransport(store, parameters.maxIssuedChallengesPerBucket),
     stableBinding: request => ({ amount: request.amount, currency: request.currency, recipient: request.recipient,
       externalId: request.externalId ?? '', methodDetails: request.methodDetails }),
     async verify({ credential, envelope }) {
       let paymentReserved = false
       try {
-        if (envelope) await paymentBoundary(() => assertIssuedChallenge(store, credential.challenge))
+        if (envelope) await paymentBoundary(() => assertIssuedChallenge(store, credential.challenge, parameters.maxIssuedChallengesPerBucket))
         const request = C.RequestSchema.parse(credential.challenge.request)
         const parsedPayload = C.PayloadSchema.safeParse(credential.payload)
         if (!parsedPayload.success) throw new Errors.MalformedCredentialError({ reason: 'Malformed payment payload' })

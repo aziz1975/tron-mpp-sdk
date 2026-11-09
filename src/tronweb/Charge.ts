@@ -4,7 +4,7 @@ import * as C from '../protocol/Charge.js'
 import * as P from '../protocol/Primitives.js'
 import { tokenAbi, permit2Abi, verifyTransfers } from './Token.js'
 import { createContractSignatureVerifier, waitForReceipt, type TronTransport, type ConfirmationOptions } from './Transport.js'
-import { TransactionNotSubmittedError, TransactionOutcomeUnknownError } from '../protocol/Errors.js'
+import { TransactionNotSubmittedError, TransactionOutcomeUnknownError, TransactionRevertedError } from '../protocol/Errors.js'
 
 function signatureParts(signature: Hex) {
   return [Number.parseInt(signature.slice(130), 16), `0x${signature.slice(2, 66)}`, `0x${signature.slice(66, 130)}`] as const
@@ -80,7 +80,12 @@ export function createChargeAdapter(transport: TronTransport, options: Confirmat
       const data = encodeFunctionData({ abi: tokenAbi, functionName: 'transfer', args: [request.recipient, BigInt(request.amount)] })
       if (!broadcast) return transport.signTransaction(request.currency, data)
       const hash = await transport.send(request.currency, data)
-      await waitForReceipt(transport, hash, options)
+      try { await waitForReceipt(transport, hash, options) }
+      catch (error) {
+        if (error instanceof TransactionRevertedError) throw error.hash === hash ? error : new TransactionRevertedError(hash)
+        if (error instanceof TransactionOutcomeUnknownError && error.hash === hash) throw error
+        throw new TransactionOutcomeUnknownError(hash, error)
+      }
       return hash
     },
   }

@@ -54,7 +54,7 @@ export class TransactionRevertedError extends Errors.PaymentError {
   readonly title = 'Transaction Reverted'
   readonly type = 'https://paymentauth.org/problems/transaction-reverted'
   override readonly status = 409
-  constructor() { super('TRON transaction reverted.') }
+  constructor(readonly hash?: Hex) { super('TRON transaction reverted.', hash ? { details: { hash } } : undefined) }
 }
 
 export class SessionError extends Errors.PaymentError {

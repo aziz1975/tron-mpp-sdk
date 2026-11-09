@@ -116,7 +116,7 @@ export async function waitForReceipt(transport: TronTransport, hash: Hex, option
   do {
     const info = await transport.info(hash)
     const status = await receiptStatus(transport, hash, info, confirmations)
-    if (status === 'reverted') throw new TransactionRevertedError()
+    if (status === 'reverted') throw new TransactionRevertedError(hash)
     if (status === 'success') return info
     if (Date.now() >= end) break
     await new Promise(resolve => setTimeout(resolve, options.pollIntervalMs ?? 1000))

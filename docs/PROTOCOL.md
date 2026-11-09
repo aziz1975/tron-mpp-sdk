@@ -276,10 +276,13 @@ does not cache protected-handler responses. A new signed nonce authorizes a new
 billable request, subject to the accepted voucher's remaining credit.
 
 For existing channels, the client queries the bound wallet's adapter before
-signing. It verifies the payer, payee, token, active state and available on-chain
-balance. A voucher requires `deposit - settled >= amount`; a planned funding
-increase is included in this check. Management top-ups and closes may operate on
-an exhausted channel. Prepared updates must match an advertised resume channel.
+signing. It verifies the payer, payee, token, active state and cumulative deposit
+bounds, including any planned funding increase. Settlement transfers accepted
+funds to the merchant; unused prepaid service credit remains available. The client
+does not subtract on-chain settlement from service credit. Only the server's
+`acceptedCumulative - spent` accounting determines whether another unit is paid.
+Management top-ups and closes may operate on an exhausted channel. Prepared
+updates must match an advertised resume channel.
 
 The wallet helper's `open`/`topUp` explicitly approve the escrow for the requested
 amount and wait for confirmed funding. Supply `voucherSigner` when delegating to
@@ -316,7 +319,25 @@ behavior, without rebroadcasting an authorization.
 
 The HTTP transport persists complete issued challenges and compares the
 echoed auth-params before verification, in addition to Mppx's HMAC and route checks.
-Keep these records until challenge expiry. Low-level `manager.accept` and
+Challenges must have a finite future expiry; Mppx defaults to five minutes.
+The registry uses 256 persistent buckets (`tron:issued:v2:<bucket>`), selected by
+the hash of the challenge ID. Each bucket holds at most
+`maxIssuedChallengesPerBucket` live entries (default 64, configurable on charge
+and session methods). Use the same limit for methods sharing a store. Expired
+entries are pruned atomically on issuance or verification in that bucket. Idle
+buckets can retain expired entries, but total registry growth is bounded by the
+256 buckets and configured limit. Full buckets return 503 without a payment
+challenge; still-valid entries are never evicted to make room.
+
+During upgrades, valid legacy `tron:issued:<id>` records migrate when verified
+and bucket capacity is available; they remain usable if the bucket is full.
+Expired legacy records are removed when accessed. The Store API cannot enumerate
+old keys. After the last legacy challenge has expired, remove only legacy
+`tron:issued:<id>` keys with your storage backend's maintenance tools, preserving
+the new `tron:issued:v2:*` buckets and all payment journals and replay markers.
+If previously configured challenges had no expiry, reissue them with finite expiry.
+
+Low-level `manager.accept` and
 `manager.consume` are trusted application APIs; callers must authenticate session
 ownership and challenge issuance themselves. A declared `source` is not proof
 of ownership. `manager.acceptRequest` additionally verifies the request proof,
@@ -348,6 +369,17 @@ service delivery or refund. Unknown submissions without a saved hash remain
 blocked for operator investigation. A provably unsubmitted attempt releases its
 charge reservation; a confirmed reverted charge remains rejected and requires a
 new challenge. Never delete an unresolved reservation merely to retry a payment.
+
+In client-broadcast hash mode, the built-in adapter wraps RPC/confirmation errors
+after submission in `TransactionOutcomeUnknownError`, retaining the known hash.
+The client also preserves that hash if final credential validation fails after
+payment, including challenge expiry. Read `error.hash` or `error.details.hash`
+and confirm that transaction before paying again. A confirmed revert retains its
+hash in `TransactionRevertedError` and remains a definitive failure. These client
+errors occur before the server has a journal, so `chargeMethod.reconcile` cannot
+recover them. Applications can confirm the known transfer and submit its hash
+against an active matching challenge under their hash-payment policy, or arrange
+service delivery/refund. They must not automatically broadcast another transfer.
 
 Close and settle use persisted operation
 records too. A confirmed revert or a `TransactionNotSubmittedError` clears that
@@ -420,7 +452,8 @@ Persisted charge replay keys now use
 `tron:charge:transaction:<numeric chainId>:<0x-prefixed transaction hash>` and charge
 journals use `tron:charge:challenge:<chainId>:<challengeId>`. Migrate any existing
 token-payment replay history and reconcile pending submissions before upgrading a
-running service. Keep session accounting and issued-challenge records intact.
+running service. Keep session accounting and live issued-challenge records intact;
+follow the bounded registry migration guidance above for expired legacy records.
 
 Charge journals now have `version: 1` and retain the data needed for recovery.
 Legacy consumed transaction markers continue blocking reuse. Legacy charge

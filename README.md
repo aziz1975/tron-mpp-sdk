@@ -87,6 +87,17 @@ Retain the charge method to call `chargeMethod.reconcile(challengeId)` after an
 uncertain submission. Retrying the same credential also confirms its saved hash
 without broadcasting again. Reconciliation returns a receipt without executing
 the protected handler; submissions without a known hash need operator recovery.
+In client-broadcast hash mode, failures after submission preserve the transaction
+hash on the error (`error.hash` and `error.details.hash`), including RPC failures
+and challenge expiry during confirmation. Confirm that transaction before any
+new payment; a confirmed revert remains a `TransactionRevertedError`.
+
+Issued HTTP challenges require a finite future expiry (Mppx defaults to five
+minutes). The shared store uses 256 bounded buckets, each retaining at most
+`maxIssuedChallengesPerBucket` live challenges (default 64). Expired entries are
+pruned when their bucket is used. A full bucket returns 503 without issuing a new
+challenge; existing challenges remain valid. See the protocol guide for upgrading
+persistent stores from the previous issued-challenge format.
 
 ## Sessions
 
@@ -100,7 +111,9 @@ release the operation for retry.
 
 Session clients supply a `wallet` plus `preparePayment`, which returns an unsigned
 payment plan. The SDK checks the cumulative spending limit and existing channel
-balance before wallet signing or funding. HTTP credentials include a separate
+deposit before wallet signing or funding. Settling a voucher leaves unused prepaid
+service credit available; the server tracks how much service was actually spent.
+HTTP credentials include a separate
 signed request proof; public settlement vouchers alone cannot authorize service.
 The built-in wallet signs this proof automatically. Custom wallets must implement
 `signRequest`. Each service request nonce is consumed once; replayed credentials

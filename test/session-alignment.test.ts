@@ -189,7 +189,7 @@ describe('session client policy before wallet execution', () => {
   it.each(['empty', 'payer', 'payee', 'token', 'finalized', 'closing'] as const)('rejects an invalid resume channel: %s', async invalid => {
     const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
     f.request.methodDetails.channelId = id
-    if (invalid === 'empty') f.chain.settled = f.chain.deposit
+    if (invalid === 'empty') f.chain.deposit = '0'
     if (invalid === 'payer') f.chain.payer = other.address
     if (invalid === 'payee') f.chain.payee = other.address
     if (invalid === 'token') f.chain.token = recipient

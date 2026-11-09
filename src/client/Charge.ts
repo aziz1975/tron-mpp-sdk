@@ -2,6 +2,7 @@ import { Credential, Method } from 'mppx'
 import type { Hex } from 'viem'
 import * as C from '../protocol/Charge.js'
 import * as P from '../protocol/Primitives.js'
+import { TransactionOutcomeUnknownError } from '../protocol/Errors.js'
 
 export type ChargeParameters = {
   adapter: C.Adapter
@@ -68,9 +69,14 @@ export function charge(parameters: ChargeParameters) {
         C.assertChallengeActive(challenge)
         payload = { type, signature: await adapter.createTransaction!(request, false) }
       }
-      payload = C.PayloadSchema.parse(payload)
-      await C.validatePayload({ challenge: c, payload, payer, authorizationDomain: parameters.authorizationDomain, contractSignature: adapter.contractSignature })
-      return Credential.serialize(Credential.from({ challenge, payload, source: P.formatSource(payer, adapter.chainId) }))
+      try {
+        payload = C.PayloadSchema.parse(payload)
+        await C.validatePayload({ challenge: c, payload, payer, authorizationDomain: parameters.authorizationDomain, contractSignature: adapter.contractSignature })
+        return Credential.serialize(Credential.from({ challenge, payload, source: P.formatSource(payer, adapter.chainId) }))
+      } catch (error) {
+        if (payload.type === 'hash') throw new TransactionOutcomeUnknownError(payload.hash, error)
+        throw error
+      }
     },
   })
 }
