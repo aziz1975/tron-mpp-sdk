@@ -18,6 +18,7 @@ export type SessionParameters = {
   store: Store.AtomicStore
   /** Maximum live challenges per each of 256 storage buckets. Default: 64. */
   maxIssuedChallengesPerBucket?: number
+  /** Charge one unit before service delivery. Set false to meter with manager.consume instead. */
   chargeOnVerify?: boolean
   /** Maximum retained request IDs per channel. New IDs are rejected at the limit. Default: 10,000. */
   maxIdempotencyRecords?: number
@@ -84,9 +85,9 @@ export class SessionManager {
       parseInput(S.PayloadSchema, payloadInput, 'session payload'), source))
   }
   /** HTTP callers must also verify challenge issuance and route binding. */
-  acceptRequest(challenge: S.Challenge, payloadInput: S.Payload, source?: string): Promise<SessionState> {
+  acceptRequest(challenge: S.Challenge, payloadInput: S.Payload, source?: string, options: { requireServiceUnit?: boolean } = {}): Promise<SessionState> {
     return paymentBoundary(() => this.acceptValidated(parseInput(S.RequestSchema, challenge.request, 'session request'),
-      parseInput(S.PayloadSchema, payloadInput, 'session payload'), source, challenge))
+      parseInput(S.PayloadSchema, payloadInput, 'session payload'), source, challenge, options.requireServiceUnit))
   }
   private async verifyVoucher(request: S.Request, payload: S.Payload, channel: S.Channel, deposit = channel.deposit): Promise<void> {
     if (payload.action === 'topUp') return
@@ -96,7 +97,8 @@ export class SessionManager {
       signature, signer, this.parameters.adapter.contractSignature)) fail('invalid-signature', 402, 'Voucher signature invalid.')
     if (BigInt(payload.cumulativeAmount) > BigInt(deposit)) fail('amount-exceeds-deposit', 402, 'Voucher exceeds deposit.')
   }
-  private async acceptValidated(request: S.Request, payload: S.Payload, source?: string, challenge?: S.Challenge): Promise<SessionState> {
+  private async acceptValidated(request: S.Request, payload: S.Payload, source?: string, challenge?: S.Challenge,
+    requireServiceUnit = this.parameters.chargeOnVerify !== false): Promise<SessionState> {
     const id = payload.channelId
     this.assertRequest(request, id)
     await this.assertGrace()
@@ -118,7 +120,7 @@ export class SessionManager {
     const before: S.Channel = funding?.action === 'open'
       ? { payer: funding.authorization.from, payee: request.recipient, token: request.currency, authorizedSigner: funding.authorizedSigner ?? P.zeroAddress,
         deposit: amount!, settled: '0', closeRequestedAt: '0', finalized: false }
-      : await this.channel(request, id, payload.action === 'close')
+      : await this.channel(request, id, payload.action === 'close' || payload.action === 'topUp')
     const proposedDeposit = BigInt(before.deposit) + (funding?.action === 'topUp' ? BigInt(amount!) : 0n)
     if (proposedDeposit >= 1n << 128n) throw new InvalidRequestError('Deposit exceeds uint128.')
     if (source && funding?.action !== 'topUp' && !P.isSameAddress(this.source(source, request.methodDetails.chainId), before.payer)) fail('signer-mismatch', 402, 'Session source mismatch.')
@@ -136,7 +138,7 @@ export class SessionManager {
       const cumulative = BigInt(payload.cumulativeAmount)
       if (payload.action === 'close' && cumulative < spent) fail('insufficient-balance', 402, 'Close voucher does not cover delivered service.')
       if (payload.action !== 'close' && cumulative > accepted && cumulative - accepted < BigInt(request.methodDetails.minVoucherDelta ?? '0')) fail('delta-too-small', 402, 'Voucher increment below minimum.')
-      if (challenge && this.parameters.chargeOnVerify !== false && payload.action !== 'close' &&
+      if (challenge && requireServiceUnit && payload.action !== 'close' &&
           (cumulative > accepted ? cumulative : accepted) - spent < BigInt(request.amount)) fail('insufficient-balance', 402, 'Voucher does not cover one service unit.')
     }
     if (challenge) {
@@ -154,7 +156,7 @@ export class SessionManager {
       await this.parameters.adapter.verifyTransaction(payload.hash, payload.action, id,
         payload.action === 'topUp' ? payload.additionalDeposit : undefined)
     }
-    const channel = await this.channel(request, id, payload.action === 'close')
+    const channel = await this.channel(request, id, payload.action === 'close' || payload.action === 'topUp')
     if (source && funding?.action !== 'topUp' && !P.isSameAddress(this.source(source, request.methodDetails.chainId), channel.payer)) fail('signer-mismatch', 402, 'Session source mismatch.')
     if (payload.action === 'open') {
       const expected = P.computeChannelId({ payer: channel.payer, payee: channel.payee, token: channel.token,
@@ -370,16 +372,21 @@ export function session(parameters: SessionParameters): Method.Server<typeof S.m
       if (envelope) await assertIssuedChallenge(parameters.store, credential.challenge, parameters.maxIssuedChallengesPerBucket)
       const request = parseInput(S.RequestSchema, credential.challenge.request, 'session request')
       const payload = parseInput(S.PayloadSchema, credential.payload, 'session payload')
-      let state = await manager.acceptRequest({ ...credential.challenge, request }, payload, credential.source)
-      if (parameters.chargeOnVerify !== false && (payload.action === 'open' || payload.action === 'voucher')) state = await manager.consume(request, payload.channelId, 1,
+      const voucherOnly = payload.action === 'voucher' && envelope?.capturedRequest.method === 'HEAD'
+      const charge = parameters.chargeOnVerify !== false && !voucherOnly
+      let state = await manager.acceptRequest({ ...credential.challenge, request }, payload, credential.source, { requireServiceUnit: charge })
+      // Metered service still consumes its request nonce before the handler runs.
+      // HEAD voucher updates are idempotent management actions and never deliver service.
+      if (!voucherOnly && (payload.action === 'open' || payload.action === 'voucher')) state = await manager.consume(request, payload.channelId, charge ? 1 : 0,
         `http:${payload.requestAuthorization!.nonce}`, { rejectReplay: true })
       return Receipt.from({ method: 'tron', intent: 'session', status: 'success', reference: payload.channelId,
         timestamp: new Date().toISOString(), challengeId: credential.challenge.id, channelId: payload.channelId,
         acceptedCumulative: state.acceptedCumulative, spent: state.spent, chainId: request.methodDetails.chainId,
         ...(state.txHash ? { txHash: state.txHash } : {}) })
     },
-    respond({ credential, receipt }) {
-      if (parameters.chargeOnVerify === false || credential.payload.action === 'topUp' || credential.payload.action === 'close') return Response.json(receipt)
+    respond({ credential, receipt, envelope }) {
+      if (credential.payload.action === 'voucher' && envelope?.capturedRequest.method === 'HEAD') return new Response(null)
+      if (credential.payload.action === 'topUp' || credential.payload.action === 'close') return Response.json(receipt)
       return undefined
     },
   })

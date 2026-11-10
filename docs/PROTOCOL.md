@@ -169,15 +169,22 @@ const payment = Mppx.create({
 const paidSession = payment.session({ amount: '100', unitType: 'request' })
 ```
 
-By default a successful open/voucher request atomically consumes one service unit
-before the handler runs. TopUp/close are management actions and return a receipt
-without running the protected handler. For a control-only endpoint or a metered
-stream, set `chargeOnVerify: false`; the method returns a management response, and
-the application uses `sessionMethod.manager.consume(request, channelId, units,
+By default a successful open/voucher service request atomically consumes one service
+unit before the handler runs. A `HEAD` voucher update is an idempotent management
+action: it accepts the voucher and any merged funding without consuming service
+credit, and returns an empty response with a `Payment-Receipt` header. It works
+even when existing voucher credit is exhausted. TopUp/close are also management
+actions and return a receipt without running the protected handler.
+
+For a metered stream, set `chargeOnVerify: false` and pass the streaming response
+to `result.withReceipt(response)`. Open/voucher service requests still run the
+handler and consume their signed nonce once, with no automatic debit. The
+application uses `sessionMethod.manager.consume(request, channelId, units,
 idempotencyKey)` before delivering each paid chunk. Always provide unit count and
-an application-controlled idempotency key consistently. The HTTP integration uses
-the signed request nonce as its service-consumption key and rejects duplicate
-credentials before granting another handler execution. The client-supplied
+an application-controlled idempotency key consistently. The HTTP integration
+rejects duplicate service credentials before granting another handler execution.
+Control-only handlers using `chargeOnVerify: false` must supply their own response.
+The client-supplied
 `Idempotency-Key` header is not used for payment deduplication: fresh signed
 requests are charged separately even when that header is reused. Applications
 requiring business-operation idempotency must cache their results or reject
@@ -297,6 +304,9 @@ authorizedSigner; topUp witnesses bind channelId. EIP-3009 uses deterministic
 the existing payer's channel; refunds always go to that payer. Sponsored topUps
 preserve any pending forced-close deadline, including when a relayer submits
 funding signed by the payer. Only a direct payer `topUp` cancels a pending close.
+Standalone topUp management requests remain available during a pending forced
+close; vouchers, including those with merged funding, and service consumption
+remain unavailable. Finalized channels reject top-ups.
 
 `manager.settle(channelId)` submits the highest persisted voucher. Cooperative
 close uses a final voucher covering all delivered service and does not require a

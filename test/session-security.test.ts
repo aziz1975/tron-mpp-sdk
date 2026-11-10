@@ -1,4 +1,4 @@
-import { Challenge, Credential, Store } from 'mppx'
+import { Challenge, Credential, Receipt, Store } from 'mppx'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Hex, TypedDataDefinition } from 'viem'
 import { describe, expect, it, vi } from 'vitest'
@@ -37,8 +37,8 @@ function fixture(options: Partial<SessionParameters> = {}) {
   const method = session(parameters)
   const server = Mppx.create({ secretKey: '0123456789abcdef0123456789abcdef', methods: [method] })
   const route = server.session({ amount: '1' })
-  const challenge = async (): Promise<S.Challenge> => {
-    const initial = await route(new Request('https://api.test/session'))
+  const challenge = async (httpMethod = 'GET'): Promise<S.Challenge> => {
+    const initial = await route(new Request('https://api.test/session', { method: httpMethod }))
     if (initial.status !== 402) throw new Error('Expected challenge')
     const c = Challenge.fromResponse(initial.challenge)
     return { ...c, request: S.RequestSchema.parse(c.request) }
@@ -49,7 +49,7 @@ function fixture(options: Partial<SessionParameters> = {}) {
   const header = (c: S.Challenge, payload: S.Payload, payerSource = source) => Credential.serialize(Credential.from({
     challenge: { ...c, method: 'tron', intent: 'session' }, payload, source: payerSource,
   }))
-  const submit = (authorization: string, extra: Record<string, string> = {}) => route(new Request('https://api.test/session', { headers: { Authorization: authorization, ...extra } }))
+  const submit = (authorization: string, extra: Record<string, string> = {}, httpMethod = 'GET') => route(new Request('https://api.test/session', { method: httpMethod, headers: { Authorization: authorization, ...extra } }))
   const open = async (amount = '100') => {
     const c = await challenge()
     const payload = await authorizeSessionRequest(c, await openPayload(amount), sign)
@@ -172,6 +172,142 @@ async function sponsoredOpen(f: ReturnType<typeof fixture>, type: 'permit2' | 'a
     voucherSignature: await voucherSigner(P.voucherTypedData({ chainId, escrowContract: escrow, channelId: id, cumulativeAmount: cumulative })) })
   return { c, payload: await authorizeSessionRequest(c, payload, sign) }
 }
+
+describe('Permit2 session management and metered delivery', () => {
+  async function funded(options: Partial<SessionParameters> = {}, cumulative = '100') {
+    const f = fixture({ ...options, credentialTypes: ['permit2'] })
+    const { c, payload } = await sponsoredOpen(f, 'permit2', cumulative)
+    const credential = f.header(c, payload)
+    const result = await f.submit(credential)
+    if (result.status !== 200) throw new Error('Expected Permit2 open')
+    return { ...f, credential, result }
+  }
+  async function topUp(request: S.Request, funder = account): Promise<S.Payload> {
+    const intent: S.FundingIntent = { action: 'topUp', type: 'permit2', authorization: { from: funder.address,
+      permitted: { token, amount: '10' }, nonce: '2', deadline: '9999999999', witness: { channelId: id } } }
+    return S.PayloadSchema.parse({ ...intent, channelId: id, additionalDeposit: '10', signature: await funder.signTypedData(
+      S.fundingTypedData(request, id, intent) as TypedDataDefinition) })
+  }
+
+  it.each(['open', 'voucher'] as const)('preserves the %s streaming response when automatic billing is disabled', async action => {
+    const f = await funded({ chargeOnVerify: false }, '0')
+    let result = f.result
+    if (action === 'voucher') {
+      const c = await f.challenge()
+      const payload = await authorizeSessionRequest(c, await f.voucher('10'), sign)
+      const accepted = await f.submit(f.header(c, payload))
+      if (accepted.status !== 200) throw new Error('Expected metered voucher')
+      result = accepted
+    }
+    expect(await f.method.manager.state(id)).toMatchObject({ spent: '0' })
+    if (action === 'voucher') await expect(f.method.manager.consume((await f.challenge()).request, id, 3, 'stream:chunk:1')).resolves.toMatchObject({ spent: '3' })
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(encoder.encode('event: content\ndata: hello\n\n'))
+      controller.close()
+    } })
+    const response = result.withReceipt(new Response(stream, { headers: { 'content-type': 'text/event-stream' } }))
+    expect(response.headers.get('content-type')).toBe('text/event-stream')
+    expect(Receipt.fromResponse(response)).toMatchObject({ channelId: id, spent: '0' })
+    expect(await response.text()).toBe('event: content\ndata: hello\n\n')
+  })
+
+  it('rejects replayed metered opens and concurrent voucher requests without charging a unit', async () => {
+    const f = await funded({ chargeOnVerify: false }, '0')
+    const replay = await f.submit(f.credential)
+    if (replay.status !== 402) throw new Error('Expected replay rejection')
+    expect(replay.challenge.status).toBe(409)
+    const c = await f.challenge()
+    const credential = f.header(c, await authorizeSessionRequest(c, await f.voucher('10'), sign))
+    const results = await Promise.all([f.submit(credential), f.submit(credential)])
+    expect(results.map(r => r.status).sort()).toEqual([200, 402])
+    expect(await f.method.manager.state(id)).toMatchObject({ spent: '0', requestCount: 2 })
+  })
+
+  it('accepts idempotent HEAD voucher updates on exhausted credit without billing or serving content', async () => {
+    const f = await funded({}, '1')
+    const c = await f.challenge('HEAD')
+    let latest = ''
+    for (const amount of ['1', '2']) {
+      const credential = f.header(c, await authorizeSessionRequest(c, await f.voucher(amount), sign))
+      latest = credential
+      for (let retry = 0; retry < 2; retry++) {
+        const result = await f.submit(credential, {}, 'HEAD')
+        if (result.status !== 200) throw new Error('Expected HEAD voucher update')
+        const response = result.withReceipt()
+        expect(response.status).toBe(200)
+        expect(response.body).toBeNull()
+        expect(Receipt.fromResponse(response)).toMatchObject({ acceptedCumulative: amount, spent: '1' })
+      }
+    }
+    expect(await f.method.manager.state(id)).toMatchObject({ spent: '1', requestCount: 1 })
+    // Changing the HTTP method cannot turn a management proof into free service.
+    expect((await f.submit(latest)).status).toBe(200)
+    expect(await f.method.manager.state(id)).toMatchObject({ spent: '2', requestCount: 2 })
+  })
+
+  it.each(['voucher', 'request'] as const)('still verifies the %s signature on HEAD voucher updates', async invalid => {
+    const f = await funded()
+    const c = await f.challenge('HEAD')
+    const payload = await authorizeSessionRequest(c, await f.voucher('100', invalid === 'voucher' ? otherSign : sign), invalid === 'request' ? otherSign : sign)
+    const result = await f.submit(f.header(c, payload), {}, 'HEAD')
+    if (result.status !== 402) throw new Error('Expected signature rejection')
+    expect(result.challenge.status).toBe(402)
+    expect(await f.method.manager.state(id)).toMatchObject({ spent: '1', requestCount: 1 })
+  })
+
+  it('merges Permit2 funding with a HEAD voucher update without consuming service credit', async () => {
+    const f = await funded({}, '1')
+    f.adapter.fund = vi.fn(async () => { f.chain.deposit = '110'; return hash })
+    const c = await f.challenge('HEAD')
+    const deposit = S.FundingSchema.parse(await topUp(c.request))
+    const payload = await authorizeSessionRequest(c, { ...await f.voucher('110'), deposit } as S.Payload, sign)
+    const result = await f.submit(f.header(c, payload), {}, 'HEAD')
+    if (result.status !== 200) throw new Error('Expected merged HEAD funding')
+    expect(Receipt.fromResponse(result.withReceipt())).toMatchObject({ spent: '1', acceptedCumulative: '110' })
+    expect(f.adapter.fund).toHaveBeenCalledTimes(1)
+    expect(await f.method.manager.state(id)).toMatchObject({ deposit: '110', spent: '1', requestCount: 1 })
+  })
+
+  it.each(['payer', 'donor'] as const)('accepts a %s Permit2 management top-up without cancelling forced close', async who => {
+    const f = await funded()
+    f.chain.closeRequestedAt = '123'
+    f.adapter.fund = vi.fn(async () => { f.chain.deposit = '110'; return hash })
+    const funder = who === 'payer' ? account : other
+    const c = await f.challenge()
+    const payload = await authorizeSessionRequest(c, await topUp(c.request, funder), data => funder.signTypedData(data as TypedDataDefinition))
+    const result = await f.submit(f.header(c, payload, P.formatSource(funder.address, chainId)))
+    if (result.status !== 200) throw new Error('Expected Permit2 management top-up')
+    expect(Receipt.fromResponse(result.withReceipt())).toMatchObject({ spent: '1', acceptedCumulative: '100' })
+    expect(f.adapter.fund).toHaveBeenCalledTimes(1)
+    expect(f.chain.closeRequestedAt).toBe('123')
+    expect(await f.method.manager.state(id)).toMatchObject({ deposit: '110', spent: '1' })
+    await expect(f.method.manager.consume(c.request, id)).rejects.toMatchObject({ status: 410 })
+  })
+
+  it.each(['GET', 'HEAD'] as const)('rejects %s vouchers with merged funding during forced close before submission', async httpMethod => {
+    const f = await funded()
+    f.chain.closeRequestedAt = '123'
+    const c = await f.challenge(httpMethod)
+    const deposit = S.FundingSchema.parse(await topUp(c.request))
+    const payload = await authorizeSessionRequest(c, { ...await f.voucher('110'), deposit } as S.Payload, sign)
+    const result = await f.submit(f.header(c, payload), {}, httpMethod)
+    if (result.status !== 402) throw new Error('Expected pending-close rejection')
+    expect(result.challenge.status).toBe(410)
+    expect(f.adapter.fund).toHaveBeenCalledTimes(1) // Initial open only.
+  })
+
+  it('rejects Permit2 management top-ups on finalized channels', async () => {
+    const f = await funded()
+    f.chain.finalized = true
+    const c = await f.challenge()
+    const payload = await authorizeSessionRequest(c, await topUp(c.request), sign)
+    const result = await f.submit(f.header(c, payload))
+    if (result.status !== 402) throw new Error('Expected finalized-channel rejection')
+    expect(result.challenge.status).toBe(410)
+    expect(f.adapter.fund).toHaveBeenCalledTimes(1) // Initial open only.
+  })
+})
 
 describe('validation before sponsored funding', () => {
   it.each(['permit2', 'authorization'] as const)('rejects an invalid %s voucher before funding', async type => {

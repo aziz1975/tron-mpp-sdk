@@ -118,6 +118,9 @@ signed request proof; public settlement vouchers alone cannot authorize service.
 The built-in wallet signs this proof automatically. Custom wallets must implement
 `signRequest`. Each service request nonce is consumed once; replayed credentials
 are rejected, and an `Idempotency-Key` header does not bypass billing.
+Use `chargeOnVerify: false` for metered streaming and debit usage with
+`manager.consume`; `withReceipt` preserves the supplied streaming response.
+`HEAD` voucher updates return a receipt without charging a service unit.
 Sponsored funding can be reconciled after authorization expiry using the saved
 exact authorization and transaction
 hash. The migration guide covers the updated client and streaming event APIs.
