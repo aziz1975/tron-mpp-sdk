@@ -94,6 +94,9 @@ describe('safe operation recovery', () => {
     await expect(manager.consume(f.request, f.channelId)).rejects.toMatchObject({ status: 410 })
     await expect(manager.accept(f.request, { ...await f.voucher(), action: 'close' })).rejects.toMatchObject({ status: 410 })
     f.chain.finalized = true; f.chain.settled = '100'
+    f.adapter.transactionStatus = async () => 'pending'
+    expect((await manager.reconcile(f.channelId)).closing).toBe(true)
+    f.adapter.transactionStatus = async () => 'success'
     expect(await manager.reconcile(f.channelId)).toMatchObject({ closed: true, closing: false, txHash: hash })
     expect(f.adapter.close).toHaveBeenCalledTimes(1)
   })
@@ -106,6 +109,17 @@ describe('safe operation recovery', () => {
     f.adapter.transactionStatus = async () => 'reverted'
     expect((await f.manager.reconcile(f.channelId)).closing).toBe(false)
     await f.manager.consume(f.request, f.channelId)
+  })
+  it('keeps settlement reserved while its observed chain state is unconfirmed', async () => {
+    const f = fixture(); await f.open()
+    f.adapter.settle = async () => { throw new P.TransactionOutcomeUnknownError(hash) }
+    await expect(f.manager.settle(f.channelId)).rejects.toMatchObject({ status: 503 })
+    f.chain.settled = '100'
+    f.adapter.transactionStatus = async () => 'pending'
+    expect(await f.manager.reconcile(f.channelId)).toMatchObject({ settledOnChain: '0', operation: { status: 'unknown' } })
+    f.adapter.transactionStatus = async () => 'success'
+    expect(await f.manager.reconcile(f.channelId)).toMatchObject({ settledOnChain: '100', closed: false })
+    expect((await f.manager.state(f.channelId))!.operation).toBeUndefined()
   })
   it('treats unclassified adapter exceptions as uncertain', async () => {
     const f = fixture(); await f.open()
@@ -224,6 +238,8 @@ describe('bounded durable request history', () => {
     const f = fixture({ requestRetentionMs: 0 }); await f.open()
     await f.manager.consume(f.request, f.channelId, 1, 'forced-close')
     f.chain.finalized = true
+    expect((await f.manager.reconcile(f.channelId)).closed).toBe(false)
+    f.adapter.confirmedChannel = async () => ({ ...f.chain })
     expect((await f.manager.reconcile(f.channelId)).closed).toBe(true)
     expect(await f.manager.pruneRequests(f.channelId)).toBe(1)
   })

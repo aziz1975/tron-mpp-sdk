@@ -109,7 +109,7 @@ and provide a shared persistent atomic store for accounting. Close/settlement
 failures retain enough state for `manager.reconcile(channelId)`; confirmed failures
 release the operation for retry.
 
-Session clients supply a `wallet` plus `preparePayment`, which returns an unsigned
+Session clients configure trusted `recipients` and supply a `wallet` plus `preparePayment`, which returns an unsigned
 payment plan. The SDK checks the cumulative spending limit and existing channel
 deposit before wallet signing or funding. Settling a voucher leaves unused prepaid
 service credit available; the server tracks how much service was actually spent.

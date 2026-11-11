@@ -137,7 +137,7 @@ describe('prepaid session credit after settlement', () => {
     expect(await method.manager.state(id)).toMatchObject({ acceptedCumulative: '3', spent: '1', settledOnChain: '3' })
     const execute = vi.fn(async () => voucher)
     const wallet: S.Wallet = { adapter, payer: account.address, createPayload: execute, signRequest: sign }
-    const client = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], payer: account.address,
+    const client = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
       maxUnitAmount: '1', maxCumulativeAmount: '3', wallet, preparePayment: async () => ({ action: 'voucher', channelId: id, cumulativeAmount: '3' }) })
     for (let spent = 2; spent <= 3; spent++) {
       const header = await client.createCredential({ challenge })

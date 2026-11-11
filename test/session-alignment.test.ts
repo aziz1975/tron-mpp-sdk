@@ -48,7 +48,7 @@ function transport(): TronTransport {
     info: async () => ({ blockNumber: 1, receipt: { result: 'SUCCESS' } }), blockNumber: async () => 1 }
 }
 function client(f: ReturnType<typeof fixture>, wallet: S.Wallet, plan: S.PaymentPlan, limit = '100') {
-  return clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], payer: account.address,
+  return clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
     maxUnitAmount: '1', maxCumulativeAmount: limit, wallet, preparePayment: vi.fn(async () => plan) })
 }
 async function funding(f: ReturnType<typeof fixture>, type: 'permit2' | 'authorization'): Promise<S.Funding> {
@@ -140,6 +140,17 @@ describe('cooperative close and streaming events', () => {
 })
 
 describe('session client policy before wallet execution', () => {
+  it('rejects an untrusted payee before preparing or executing payment', async () => {
+    const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow), preparePayment = vi.fn()
+    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
+      maxUnitAmount: '1', maxCumulativeAmount: '100', wallet, preparePayment })
+    const challenge = f.challenge()
+    challenge.request = { ...challenge.request, recipient: other.address }
+    await expect(method.createCredential({ challenge })).rejects.toThrow(/recipient is not allowed/)
+    expect(preparePayment).not.toHaveBeenCalled()
+    expect(t.send).not.toHaveBeenCalled()
+    expect(t.signTypedData).not.toHaveBeenCalled()
+  })
   it.each(['open', 'voucher', 'close'] as const)('rejects a %s above the cumulative limit before the wallet is called', async action => {
     const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
     const execute = vi.spyOn(wallet, 'createPayload')
@@ -157,7 +168,7 @@ describe('session client policy before wallet execution', () => {
   })
   it('rejects expired or malformed expiry before preparing a payment', async () => {
     const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow), preparePayment = vi.fn()
-    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], payer: account.address,
+    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
       maxUnitAmount: '1', maxCumulativeAmount: '100', wallet, preparePayment })
     for (const expires of ['invalid', new Date(Date.now() - 1).toISOString()]) await expect(method.createCredential({ challenge: { ...f.challenge(), expires } })).rejects.toThrow(/expired/)
     expect(preparePayment).not.toHaveBeenCalled(); expect(t.send).not.toHaveBeenCalled()
@@ -170,7 +181,7 @@ describe('session client policy before wallet execution', () => {
   it('rechecks expiry after payment preparation and after an approval is confirmed', async () => {
     vi.useFakeTimers()
     const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
-    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], payer: account.address,
+    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
       maxUnitAmount: '1', maxCumulativeAmount: '100', wallet, preparePayment: async () => {
         vi.setSystemTime(Date.now() + 360_000)
         return { action: 'open', type: 'hash', deposit: '200', cumulativeAmount: '100' }
@@ -241,7 +252,7 @@ describe('session client policy before wallet execution', () => {
     f.request.methodDetails = { ...f.request.methodDetails, channelId: id, credentialTypes: ['permit2'], feePayer: true, permit2Contract: permit2 }
     const plan: S.PaymentPlan = { action: 'topUp', type: 'permit2', channelId: id, additionalDeposit: '10',
       authorization: { from: other.address, permitted: { token, amount: '10' }, nonce: '7', deadline: String(Math.floor(Date.now() / 1000) + 60), witness: { channelId: id } } }
-    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], payer: other.address,
+    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: other.address,
       maxUnitAmount: '1', maxCumulativeAmount: '100', wallet, preparePayment: async () => plan })
     const header = await method.createCredential({ challenge: f.challenge() })
     expect(Credential.deserialize(header)).toMatchObject({ source: P.formatSource(other.address, chainId), payload: { action: 'topUp', type: 'permit2' } })

@@ -94,12 +94,15 @@ export type Adapter = {
   /** Must query the deployed contract; minimum permitted grace period is 900 seconds. */
   gracePeriod: () => Promise<number>
   channel: (id: Hex) => Promise<Channel | null>
+  /** Optional channel snapshot backed by the adapter's required confirmation depth. */
+  confirmedChannel?: (id: Hex) => Promise<Channel | null>
   /** Require successful mined receipt plus a matching escrow event for this channel/action/amount. */
   verifyTransaction: (hash: Hex, action: 'open' | 'topUp', channelId: Hex, amount?: string) => Promise<void>
   fund?: (request: Request, channelId: Hex, funding: Funding) => Promise<Hex>
+  /** Return only after the operation succeeds at the required confirmation depth. */
   close: (channelId: Hex, cumulativeAmount: string, signature: Hex) => Promise<P.Settlement>
   settle: (channelId: Hex, cumulativeAmount: string, signature: Hex) => Promise<P.Settlement>
-  /** Report only mined, sufficiently confirmed failures as reverted. Used for recovery; never submits. */
+  /** Report success or failure only after the required confirmation depth. Never submits. */
   transactionStatus?: (hash: Hex) => Promise<'pending' | 'success' | 'reverted'>
   /** Optional ERC-1271 support; callback must check code and current isValidSignature result. */
   contractSignature?: (signer: Address, digest: Hex, signature: Hex) => Promise<boolean>

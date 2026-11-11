@@ -236,6 +236,7 @@ const client = Mppx.create({
     chainIds: [clientTransport.chainId],
     currencies: [tokenAddress],
     escrowContracts: [escrowAddress],
+    recipients: [serverPayeeAddress],
     payer: payerAddress,
     wallet,
     maxUnitAmount: '100',
@@ -255,7 +256,8 @@ client.onCredentialCreated(({ credential }) => {
 const { fetch } = client
 ```
 
-`preparePayment` must only choose an unsigned `Session.PaymentPlan`; it must not
+The required `recipients` allowlist is checked before payment preparation, signing,
+or funding. `preparePayment` must only choose an unsigned `Session.PaymentPlan`; it must not
 sign, approve, or broadcast. The SDK validates the plan and `maxCumulativeAmount`
 before calling `wallet.createPayload`. The supplied wallet enforces the same
 policy before signing or funding and rechecks expiry after asynchronous work.
@@ -397,13 +399,15 @@ operation; the channel can be used or retried. A timeout or an unclassified
 submission exception retains it. A pending close blocks further service.
 
 Call `sessionMethod.manager.reconcile(channelId)` to inspect an uncertain close or
-settlement without broadcasting again. Confirmed finalization/settlement completes
-the operation. Reconciliation also records finalization after a payer's forced
-withdrawal, allowing its retained request records to be pruned. A known
-transaction hash confirmed reverted by the adapter releases
-the reservation. An open channel alone does not prove that an outstanding
-transaction failed. Custom adapters may implement `transactionStatus`; they must
-only return `reverted` for a mined failure at the required confirmation depth.
+settlement without broadcasting again. A known transaction hash confirmed successful
+or reverted by `transactionStatus` resolves the operation. An adapter may also
+implement `confirmedChannel`, returning only a snapshot at its required confirmation
+depth, to reconcile hashless operations and forced withdrawals. The built-in adapter
+does not provide confirmed channel snapshots, so forced withdrawals and hashless
+operations require an adapter with that capability for automatic reconciliation.
+An open channel alone does not prove that an outstanding transaction failed.
+Custom adapters must report both transaction success and failure only at the
+required confirmation depth, and close and settle must return only after confirmation.
 Use `TransactionNotSubmittedError` only when no transaction was sent, and
 `TransactionOutcomeUnknownError(hash, cause)` when submission may have succeeded.
 These errors are exported from the package root.

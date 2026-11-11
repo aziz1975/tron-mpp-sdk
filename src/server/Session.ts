@@ -283,7 +283,7 @@ export class SessionManager {
       return { op: 'set', value: { ...current, operation, closing: kind === 'close' }, result: operation }
     })
   }
-  private async finish(id: Hex, operation: SessionOperation | undefined, channel: S.Channel, hash?: Hex): Promise<SessionState> {
+  private async finish(id: Hex, operation: SessionOperation | undefined, channel: Pick<S.Channel, 'deposit' | 'settled' | 'finalized'>, hash?: Hex): Promise<SessionState> {
     return this.records.update(id, current => {
       if (!current) throw new Errors.InternalPaymentError()
       if (current.operation?.id !== operation?.id) return { op: 'noop', result: current }
@@ -315,9 +315,10 @@ export class SessionManager {
       await this.records.update(id, current => current?.operation?.id === operation.id
         ? { op: 'set', value: { ...current, operation: { ...operation, hash } }, result: undefined }
         : { op: 'noop', result: undefined })
-      const channel = await this.parameters.adapter.channel(id)
-      if (!channel || (operation.kind === 'close' ? !channel.finalized : BigInt(channel.settled) < BigInt(operation.cumulativeAmount))) throw new TransactionOutcomeUnknownError(hash)
-      return { state: await this.finish(id, operation, channel, hash), settlement }
+      const state = await this.state(id)
+      if (!state) throw new Errors.InternalPaymentError()
+      return { state: await this.finish(id, operation, { deposit: state.deposit, settled: operation.cumulativeAmount,
+        finalized: operation.kind === 'close' }, hash), settlement }
     } catch (error) { return this.operationFailed(id, operation, error, hash) }
   }
   private async close(id: Hex, amount: string, signature: Hex): Promise<SessionState> {
@@ -335,12 +336,18 @@ export class SessionManager {
       const id = parseInput(P.Bytes32Schema, channelId, 'channel ID')
       const state = await this.state(id)
       if (!state) fail('channel-not-found', 410, 'Session not found.')
-      const channel = await this.parameters.adapter.channel(id)
-      if (!state.operation) return channel?.finalized ? this.finish(id, undefined, channel) : state
+      const confirmedChannel = this.parameters.adapter.confirmedChannel
+        ? await this.parameters.adapter.confirmedChannel(id) : null
+      if (!state.operation) return confirmedChannel?.finalized ? this.finish(id, undefined, confirmedChannel) : state
       const operation = state.operation
-      if (channel && (channel.finalized || (operation.kind === 'settle' && BigInt(channel.settled) >= BigInt(operation.cumulativeAmount)))) return this.finish(id, operation, channel, operation.hash)
-      if (operation.hash && this.parameters.adapter.transactionStatus &&
-          await this.parameters.adapter.transactionStatus(operation.hash) === 'reverted') {
+      if (confirmedChannel && (confirmedChannel.finalized || (operation.kind === 'settle' && BigInt(confirmedChannel.settled) >= BigInt(operation.cumulativeAmount)))) return this.finish(id, operation, confirmedChannel, operation.hash)
+      const status = operation.hash && this.parameters.adapter.transactionStatus
+        ? await this.parameters.adapter.transactionStatus(operation.hash) : 'pending'
+      if (status === 'success') {
+        return this.finish(id, operation, { deposit: state.deposit, settled: operation.cumulativeAmount,
+          finalized: operation.kind === 'close' }, operation.hash)
+      }
+      if (status === 'reverted') {
         await this.records.update(id, current => {
           if (!current || current.operation?.id !== operation.id) return { op: 'noop', result: undefined }
           const { operation: _operation, ...rest } = current

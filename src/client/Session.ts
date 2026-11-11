@@ -7,6 +7,8 @@ export type SessionParameters = {
   chainIds: readonly number[]
   currencies: readonly string[]
   escrowContracts: readonly string[]
+  /** Trusted session payees. */
+  recipients: readonly string[]
   maxUnitAmount: string
   maxCumulativeAmount: string
   payer: string
@@ -17,10 +19,13 @@ export type SessionParameters = {
 export function session(parameters: SessionParameters) {
   if (!parameters.wallet || typeof parameters.preparePayment !== 'function') throw new TypeError('Session client requires a wallet and preparePayment.')
   const currencies = parameters.currencies.map(currency => P.TokenAddressSchema.parse(currency))
+  const recipients = parameters.recipients.map(P.normalizeAddress)
+  if (!recipients.length) throw new Error('Configure at least one trusted session recipient.')
   P.Uint128Schema.parse(parameters.maxCumulativeAmount)
   return Method.toClient(S.method, {
     async createCredential({ challenge }) {
       const request = S.RequestSchema.parse(challenge.request)
+      if (!recipients.some(recipient => P.isSameAddress(recipient, request.recipient))) throw new Error('Session recipient is not allowed.')
       if (!parameters.chainIds.includes(request.methodDetails.chainId) ||
           !currencies.some(c => P.isSameAddress(c, request.currency)) ||
           !parameters.escrowContracts.some(c => P.isSameAddress(c, request.methodDetails.escrowContract))) throw new Error('Session chain, token or escrow is not allowed.')

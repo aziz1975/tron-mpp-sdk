@@ -88,7 +88,7 @@ describe('TRON protocol primitives', () => {
     expect(() => serverTron.charge({ adapter: adapter(), chainId, currency, recipient })).toThrow()
     expect(() => clientTron.charge({ adapter: adapter(), chainIds: [chainId], currencies: [currency], recipients: [recipient], maxAtomicAmount: '100' })).toThrow()
     expect(() => serverTron.session({ adapter: sessionFixture().adapter, currency, recipient, store: Store.memory() })).toThrow()
-    expect(() => clientTron.session({ chainIds: [chainId], currencies: [currency], escrowContracts: [escrow], payer: account.address,
+    expect(() => clientTron.session({ chainIds: [chainId], currencies: [currency], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
       maxUnitAmount: '1', maxCumulativeAmount: '100', wallet: { adapter: sessionFixture().adapter, signRequest: async () => { throw new Error('Must not be called') }, createPayload: async () => { throw new Error('Must not be called') } }, preparePayment: async () => { throw new Error('Must not be called') } })).toThrow()
   })
 })
