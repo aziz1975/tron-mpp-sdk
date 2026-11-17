@@ -21,7 +21,7 @@ const views = parseAbi([
   'function approve(address,uint256) returns (bool)',
 ])
 
-/** Node.js session operations bound once to the escrow in the SDK package's .env. */
+/** Node.js session operations bound to the escrow embedded during the SDK build. */
 export function createConfiguredSession(transport: TronTransport, options: ConfiguredSessionOptions) {
   const escrow = getSessionEscrowAddress(), chainId = P.ChainIdSchema.parse(transport.chainId)
   const currency = P.TokenAddressSchema.parse(options.currency), permit2 = P.normalizeAddress(options.permit2Contract)

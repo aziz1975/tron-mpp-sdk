@@ -9,9 +9,7 @@
     "src",
     "docs",
     "README.md",
-    "LICENSE",
-    ".env",
-    ".env.example"
+    "LICENSE"
   ],
   "exports": {
     ".": {
@@ -40,10 +38,11 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts src/config.ts src/session.ts src/client/index.ts src/server/index.ts src/tronweb/index.ts --format esm --sourcemap --clean && tsc -p tsconfig.build.json",
+    "build": "tsup && tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test:package": "node scripts/test-package.mjs"
   },
   "keywords": [
     "mpp",
