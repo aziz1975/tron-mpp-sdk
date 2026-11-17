@@ -144,3 +144,28 @@ npm run build
 
 Contract tests and TRON compilation are maintained in the separate
 [`tron-mpp-sdk-contract`](../tron-mpp-sdk-contract/README.md) repository.
+
+### Session escrow configuration (Node.js)
+
+The Node.js `tron-mpp-sdk/session` entry point reads `TRON_SESSION_ESCROW_ADDRESS` directly from the SDK package's `.env` when `createConfiguredSession` is called. It validates and captures the deployment for that instance; it does not read the app's escrow environment variable or modify the process environment. Missing or invalid SDK configuration fails before any transaction is sent. Configure an escrow deployed on the transport's network.
+
+```ts
+import { createConfiguredSession } from 'tron-mpp-sdk/session'
+
+const session = createConfiguredSession(transport, {
+  currency: tokenAddress,
+  permit2Contract: permit2Address,
+})
+const wallet = session.wallet
+const method = session.client({
+  recipients: [merchantAddress], payer: payerAddress,
+  maxUnitAmount: '100000', maxCumulativeAmount: '2000000',
+  preparePayment,
+})
+```
+
+Applications do not supply an escrow address. The configured session binds its wallet, client policy, channel IDs, merchant settlement authorizations, and forced-close transactions to the same SDK deployment. `inspect()` checks the configured currency, Permit2, grace period, and signing domains on-chain. `serverAdapter(payeeSigner)` authorizes merchant settlement and close operations through the configured relayer transport. `force('requestClose' | 'withdraw', channelId)` performs payer recovery operations; `approve(amount)` approves Permit2 for the configured currency.
+
+`stateBinding({ serverUrl, recipient, payer })` includes the deployment in an opaque persistence binding. Reject saved state when this binding changes. `force` and `approve` accept `beforeSubmit` and `onSubmitted(hash)` hooks for durable transaction reservations and hash persistence. Simulation runs before `beforeSubmit`; persist the hash in `onSubmitted` before confirmation. If a broadcast outcome is uncertain, retain the reservation and reconcile instead of resubmitting.
+
+`metadata` and `inspect()` expose read-only deployment information for diagnostics. The low-level APIs accepting explicit escrow addresses remain available for existing integrations. `getSessionEscrowAddress` remains available from `tron-mpp-sdk/config` for tooling, but application session flows should use `createConfiguredSession`. This Node.js entry point is separate from the existing browser-compatible protocol and client entry points.
