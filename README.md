@@ -1,6 +1,6 @@
 # tron-mpp-sdk
 
-Accept TRON **TRC-20 token payments** through the Machine Payments Protocol (MPP). The SDK supports two payment flows, called intents:
+Accept TRON **TRC-20 token payments with Permit2** through the Machine Payments Protocol (MPP). Payers sign typed payment authorizations, and a relayer submits sponsored transactions on-chain. The SDK supports two payment flows, called intents:
 
 - **Charge:** collect one payment for one request, such as buying an article.
 - **Session:** deposit tokens into escrow, then authorize payments for repeated use, such as API requests or streamed messages.
@@ -9,8 +9,8 @@ The SDK handles payment rules and verification. Your app chooses what to sell, s
 
 | Question | Charge | Session |
 | --- | --- | --- |
-| Where do the payer's tokens go first? | Directly to the merchant | Into the session escrow |
-| Is there a blockchain payment for each paid request? | Yes | Individual vouchers and usage charges are off-chain; funding and settlement are on-chain |
+| Where does Permit2 send the payer's tokens? | Directly to the merchant and any split recipients | Into the session escrow |
+| Is there an on-chain transaction for each paid request? | Yes | Vouchers and usage charges are off-chain. Funding, settlement, and close are on-chain. |
 | When does the merchant receive tokens? | When the payment is confirmed | When an authorized amount is settled or the channel closes |
 | Main public method | `tron.charge(...)` | `tron.session(...)` |
 
@@ -35,8 +35,8 @@ The package provides these entry points:
 ### Amounts, wallets, and networks
 
 - **Amounts are integer strings in token atomic units.** For a token with six decimals, `'1000000'` means 1 token and `'100000'` means 0.1 token. Your app must know the token's decimals and format prices for users.
-- **The currency is a TRC-20 contract address.** Native TRX payments are unsupported. Wallets may still spend TRX or resources to execute transactions.
-- **The payer** owns the tokens. **The merchant/payee** receives payment. **The relayer** submits sponsored transactions and pays their transaction costs. The merchant and relayer can use different wallets.
+- **The currency is a TRC-20 contract address.** Native TRX payments are unsupported. Wallets may still spend TRX or use Energy and Bandwidth for on-chain transactions.
+- **The payer** owns the tokens. **The merchant/payee** receives payment. **The relayer** submits sponsored transactions and covers their network costs. The merchant and relayer can use different wallets.
 - **A private key is not an address.** When an app configures a private key, the corresponding wallet signs. Your app owns key management and access control.
 - Addresses can be Base58Check (`T...`), `41`-prefixed hex, or 20-byte `0x` hex. The SDK compares the underlying account values. Use `toBase58Address` when displaying an address.
 
@@ -59,6 +59,17 @@ const payerTransport = createTronWebTransport(walletTronWeb, {
 The same package supports configured TRON networks; there are no separate mainnet and Nile SDK packages. The **app must supply a node and chain ID for the intended network**, along with contracts deployed on that network. `TRON_FULL_HOST` is an app configuration convention, not an environment variable the SDK reads automatically. The SDK accepts an already configured TronWeb instance or a custom transport.
 
 The transport trusts its configured chain ID; it does not discover or independently verify the node's network. Changing only the node URL does not change the chain ID. For sessions, the embedded escrow address must also belong to the intended network; the current SDK embeds one address, not a registry of deployments by chain ID. See [session deployment configuration](#session-deployment-configuration).
+
+## Credential Types
+
+Set `credentialTypes: ['permit2']` on the charge server, charge client, and session server. For a session client, return a plan with `type: 'permit2'` from `preparePayment` when opening or topping up a channel.
+
+| Flow | What the payer signs | Permit2 spender |
+| --- | --- | --- |
+| Charge | A permit for the payment terms in the HTTP 402 challenge | The relayer's address with the built-in adapter |
+| Session funding | A permit tied to the channel being opened or topped up | The escrow contract |
+
+In both flows, the payer grants a token allowance to the Permit2 contract before signing a permit. The relayer pays to submit the signed credential on-chain. The payer signs session vouchers separately, and settlement pays the merchant from escrow.
 
 ## Charge: one payment for one request
 
@@ -86,7 +97,7 @@ sequenceDiagram
     Client->>Client: Sign payment with the configured payer wallet
     Client->>Server: Request with signed payment credential
     Server->>Store: Reserve payment before submission
-    Server->>Permit2: Relayer submits signed authorization
+    Server->>Permit2: Relayer submits an on-chain transaction with the signed permit
     Permit2->>Token: Transfer USDT from payer to merchant
     Server->>Server: Confirm execution and verify token-transfer events
     Server->>Store: Save payment result and replay markers
@@ -97,16 +108,16 @@ sequenceDiagram
 ### What the SDK does for charge
 
 - Creates and verifies payment terms sent as an HTTP 402 challenge.
-- Checks the client's trusted chain IDs, tokens, recipients, price cap, and supported payment format before signing or broadcasting. Every split recipient must also be trusted.
-- Uses the configured wallet to create the selected payment credential.
-- Checks signatures and payment details, submits server-relayed payments, waits for confirmations, and checks the token-transfer events.
+- Checks the client's trusted chain IDs, tokens, recipients, Permit2 contract, spender, and price cap before signing. Every split recipient must also be trusted.
+- Uses the configured payer wallet to sign the Permit2 credential.
+- Checks signatures and payment details, submits the relayer's transaction, waits for confirmation, and verifies token transfer events.
 - Uses the supplied atomic store to record issued challenges, pending submissions, confirmed results, and duplicate-payment markers. An atomic update means concurrent requests cannot both claim the same payment.
 - Returns a payment receipt after verification and offers recovery for known pending submissions.
 
 ### What your app must do for charge
 
-- Choose the token, amount, merchant, network, accepted payment formats, and any payment splits.
-- Provide payer and relayer wallet connections and enough token balance and transaction resources.
+- Choose the token, amount, merchant, network, and any payment splits.
+- Provide a payer wallet with enough tokens and a relayer wallet with enough resources to submit the transaction.
 - Configure the locally trusted Permit2 address and spender. With the provided adapter, the charge spender must be the relayer's address.
 - Arrange the payer's token approval before a Permit2 payment. The SDK does not silently grant unlimited token approval.
 - Supply storage that survives restarts when payment records must survive restarts. Multiple server processes need a shared store with atomic updates.
@@ -177,33 +188,23 @@ const response = await fetch('https://merchant.example/article')
 
 The client handles the 402 challenge and sends the payment credential. Your app configures spending policy and uses the returned content. Each new successful charge payment spends tokens again.
 
-### Other charge payment formats
+### Permit2 payment splits
 
-Both ends must support the selected format. The client chooses from the server's advertised preference order, subject to wallet capabilities and local policy.
-
-| Format | How it works | Who pays transaction costs? |
-| --- | --- | --- |
-| `permit2` | Payer signs a Permit2 authorization; relayer calls Permit2 to transfer the tokens | Relayer; payer separately pays token-approval costs |
-| `authorization` | Payer signs a token-native EIP-3009 transfer authorization; relayer submits it | Relayer; requires a compatible token and explicitly configured signing domain |
-| `transaction` | Payer signs a TRON token-transfer transaction; server checks and broadcasts it | The payer account signing that transaction |
-| `hash` | Client broadcasts a token transfer and supplies its confirmed hash | Payer |
-
-Payment splits require Permit2. A public transaction hash alone is weaker evidence of payer identity than a signed payment credential; apps using hash mode must provide any required user authentication. See the [protocol guide](docs/PROTOCOL.md) for format details and contract-wallet support.
+Set `methodDetails.splits` on the paid route and include every split recipient in the client's trusted recipients list. Set split amounts in token atomic units. The primary recipient receives the total charge minus the splits. See the [protocol guide](docs/PROTOCOL.md#charge-server) for the complete route configuration.
 
 ### Charge recovery
 
 If submission times out, your app must check the original payment before creating another payment:
 
-- Keep the charge method and call `chargeMethod.reconcile(challengeId)` to check a known saved submission. It returns a receipt when recovery succeeds, without executing your content handler or broadcasting another transaction.
-- Retrying the same pending credential can check its saved hash without another broadcast. A completed charge credential cannot buy a second response; a replay is rejected with HTTP 402.
-- In client-broadcast hash mode, errors after submission retain the hash as `error.hash` and `error.details.hash`. Save it and check its outcome before paying again. A confirmed revert remains a `TransactionRevertedError`.
-- If a submission has no known hash, the app/operator must investigate the submitting wallet. Do not discard the pending record to force another payment.
+- Call `chargeMethod.reconcile(challengeId)` to check a saved transaction hash and recover the receipt. This call only checks payment status and leaves content delivery to your app.
+- Retrying the same pending credential can check the saved transaction hash without rebroadcasting. The server rejects replay of a completed charge credential with HTTP 402.
+- If the store has a pending record but no transaction hash, investigate the relayer's wallet and retain the record until you know the outcome.
 
 ## Session: fund once, authorize ongoing use
 
-For example, Alice deposits 1 USDT into escrow to buy messages from Bob at 0.1 USDT each. Instead of sending a blockchain transaction for each message, Alice signs **vouchers** and Bob records usage off-chain. Later, escrow pays Bob and refunds Alice's unsettled remainder.
+For example, Alice deposits 1 USDT into escrow to buy messages from Bob at 0.1 USDT each. Alice signs **vouchers** and Bob records usage off-chain. On-chain transactions fund the channel, pay Bob from escrow, and refund any unsettled remainder to Alice when the channel closes.
 
-A voucher is a signed authorization for a **cumulative total**. A voucher for 0.4 USDT followed by one for 0.8 USDT authorizes 0.8 USDT total, not 1.2 USDT. The merchant can settle the accepted authorized amount even if some corresponding service has not been used yet.
+A voucher is a signed authorization for a **cumulative total**. A voucher for 0.4 USDT followed by one for 0.8 USDT raises the authorized total to 0.8 USDT. The merchant can settle the full accepted voucher before the payer uses all the corresponding service credit.
 
 ### Session terms in plain language
 
@@ -214,7 +215,7 @@ A voucher is a signed authorization for a **cumulative total**. A voucher for 0.
 | Voucher / `acceptedCumulative` | The highest cumulative amount authorized by an accepted spending voucher |
 | `spent` | Total price of service the app has charged through the SDK's accounting |
 | `settledOnChain` | Total tokens already paid from escrow to the merchant, as recorded by the server |
-| Top-up | Additional tokens moved from payer to escrow; it does not itself raise voucher authorization |
+| Top-up | Additional tokens moved from payer to escrow; it does not itself increase the voucher limit |
 | Settlement | Pay an authorized amount from escrow while keeping the channel open |
 | Cooperative close | Finalize the channel with payer/merchant cooperation, pay any further amount owed, and refund the remainder |
 | Forced close | Payer starts a waiting period, then withdraws the unsettled remainder without needing merchant cooperation |
@@ -234,7 +235,7 @@ sequenceDiagram
     participant Escrow as Escrow contract
     participant Permit2 as Permit2 contract
     participant Token as USDT contract
-    Note over Buyer,Token: Buyer explicitly approves the USDT contract to allow Permit2 transfers
+    Note over Buyer,Token: Buyer grants Permit2 an allowance on the USDT contract
     Buyer->>Client: Choose a 1-USDT opening deposit
     Client->>Server: Request session terms
     Server-->>Client: HTTP 402 with unit price and channel terms
@@ -252,7 +253,7 @@ sequenceDiagram
     Buyer->>Buyer: Save channel ID and receipt
 ```
 
-The outer transaction targets **escrow**, which then calls **Permit2**. For a Permit2 charge, the relayer calls Permit2 directly. In both flows, Permit2 instructs the token contract to move tokens directly to their destination; it does not hold the payment.
+The session funding transaction targets **escrow**, which then calls **Permit2**. For a charge, the relayer's transaction targets Permit2 directly. Permit2 instructs the token contract to transfer funds directly from the payer to the recipients or to escrow.
 
 ### Session voucher and service sequence
 
@@ -280,10 +281,10 @@ sequenceDiagram
         Server-->>Service: Debit saved
         Service-->>Buyer: Message and updated receipt
     end
-    Note over Buyer,Service: No blockchain transaction for voucher updates or individual messages
+    Note over Buyer,Service: No on-chain transaction for voucher updates or individual messages
 ```
 
-The request proof authenticates this particular HTTP request. A voucher published during settlement cannot be reused to obtain someone else's service. Replaying a successful service credential returns HTTP 409; a new signed request is a new service attempt, subject to available credit. Updating the same voucher through `HEAD` is idempotent and does not charge a unit.
+The credential's `requestAuthorization` proof binds it to the HTTP challenge and payload. A voucher published during settlement cannot be reused on its own to obtain someone else's service. Replaying a successful service credential returns HTTP 409. A new signed request is a new service attempt, subject to available credit. Repeating the same voucher update through `HEAD` does not charge a unit.
 
 ### Session settlement and close sequence
 
@@ -297,27 +298,27 @@ sequenceDiagram
     participant Token as USDT contract
     Service->>Server: Choose to settle the accepted voucher
     Server->>Store: Reserve settlement and load voucher
-    Server->>Server: Use configured merchant signer for authorization
-    Server->>Escrow: Relayer submits settlement
+    Server->>Server: Merchant signs settlement authorization
+    Server->>Escrow: Relayer submits settlement transaction
     Escrow->>Token: Transfer newly owed amount to merchant
     Server->>Store: Save confirmed settlement accounting
     Buyer->>Buyer: Choose final total and sign close credential
     Buyer->>Server: Submit cooperative close
     Server->>Store: Reserve close and validate final voucher
-    Server->>Server: Use configured merchant signer for close authorization
-    Server->>Escrow: Relayer submits close
+    Server->>Server: Merchant signs close authorization
+    Server->>Escrow: Relayer submits close transaction
     Escrow->>Token: Pay any additional amount to merchant
     Escrow->>Token: Refund remaining tokens to original payer
     Server->>Store: Save finalized channel accounting
     Server-->>Buyer: Close receipt
 ```
 
-This shows `createConfiguredSession(...).serverAdapter(payeeSigner)`, where the merchant signs off-chain and a relayer submits. Permit2 is used for funding; settlement and refunds spend tokens already held by escrow.
+This shows `createConfiguredSession(...).serverAdapter(payeeSigner)`, where the merchant signs off-chain and a relayer submits the settlement and close transactions. Permit2 funds the channel. Settlement and refunds use the tokens held by escrow.
 
 ### What the SDK does for sessions
 
 - Checks trusted channel terms, token, chain, merchant, unit-price cap, and cumulative spending cap before the configured wallet signs or funds a payment plan.
-- Uses the wallet to sign vouchers, funding authorizations, and separate HTTP request proofs. Custom wallets must implement `signRequest` as well as payment signing.
+- Uses the wallet to sign vouchers, funding permits, and separate HTTP request proofs. Custom wallets must implement `signRequest` as well as payment signing.
 - With the configured helpers, resolves the embedded escrow, builds sponsored funding calls, and confirms the expected channel and deposit events.
 - Verifies vouchers and request proofs, rejects reused service credentials, and updates accounting through the app-provided atomic store.
 - Debits a service unit automatically by default, or debits explicit usage when the app calls `manager.consume`.
@@ -326,11 +327,11 @@ This shows `createConfiguredSession(...).serverAdapter(payeeSigner)`, where the 
 ### What your app must do for sessions
 
 - Arrange a compatible escrow deployment, its token allowlist, Permit2 address, and network. The SDK does not deploy contracts. Supported tokens must transfer the exact amount and must not rebase balances.
-- Set the service price and unit, payer spending limits, deposit/top-up amounts, trusted merchant, network, and funding format.
-- Provide wallets and transaction resources. The merchant signer must belong to the channel's payee; a separate relayer may pay transaction costs.
+- Set the service price and unit, payer spending limits, deposit and top-up amounts, trusted merchant, and network.
+- Provide the merchant's wallet to sign settlement and close authorizations. The relayer can use a separate wallet to submit those transactions and cover the network costs.
 - Arrange token approval when funding requires it. The escrow is the Permit2 spender for sessions; the payer's token allowance is still granted to Permit2.
 - Implement `preparePayment` to return unsigned instructions: open, update a voucher, top up, merge funding with a voucher, or close. Choose amounts from local policy and saved state. Do not sign, approve, or broadcast inside that callback; the SDK checks the plan before wallet execution.
-- Supply shared persistent storage with atomic updates for server accounting. Save client channel IDs, receipts, exact pending credentials, and submitted hashes durably as needed for recovery.
+- Supply shared persistent storage with atomic updates for server accounting. Save client channel IDs, receipts, exact pending credentials, and known transaction hashes for recovery.
 - Build the HTTP routes and service responses. Choose automatic billing or explicit metering, and persist each manual debit before delivering that unit.
 - Decide when to ask for a higher voucher, accept more deposits, settle, close, reconcile, and prune old request records. Operator routes and their authentication belong to the app.
 - Handle delivery failures and business retries. The SDK does not cache article/message bodies or guarantee that a saved debit reached the user's screen.
@@ -416,7 +417,7 @@ Mppx handles management responses such as `HEAD` voucher updates, top-ups, and c
 | `session.client(...)` | Create the client method with the embedded escrow and transport chain ID already selected |
 | `session.assertRequest(request)` | Reject a challenge with a different chain ID or escrow |
 | `session.computeChannelId(...)` | Calculate the channel ID from its participants, token, salt, signer, chain, and escrow |
-| `session.serverAdapter(payeeSigner)` | Build the server adapter using merchant authorization signatures and relayer submission |
+| `session.serverAdapter(payeeSigner)` | Use the merchant's authorization signatures to relay settlement and close transactions |
 | `session.approve(amount, hooks)` | Explicitly approve Permit2 on the configured token contract |
 | `session.force(action, channelId, hooks)` | Submit payer forced-close or withdrawal operations |
 | `session.stateBinding(...)` | Identify which deployment and wallets a saved client state belongs to |
@@ -425,7 +426,7 @@ For tooling, `getSessionEscrowAddress()` from `tron-mpp-sdk/config` returns the 
 
 ### Session client example
 
-The app supplies `payerTransport`, token/Permit2/merchant/payer addresses, and a `choosePaymentPlan` callback implementing `preparePayment`. The [integration guide](docs/PROTOCOL.md#sessions) shows payment-plan examples and alternative funding formats.
+The app supplies `payerTransport`, token, Permit2, merchant and payer addresses, and a `choosePaymentPlan` callback implementing `preparePayment`. For Permit2 funding plans, the `authorization` field holds the unsigned permit data. On open, use `session.computeChannelId(...)` with the same payer, payee, salt, and optional authorized signer as the plan. The SDK validates the plan before signing. See the [integration guide](docs/PROTOCOL.md#sessions) for funding details.
 
 ```ts
 import { Mppx } from 'tron-mpp-sdk/client'
@@ -459,23 +460,23 @@ Your app chooses the action and amount in `choosePaymentPlan` and saves the resu
 
 A stream is a way to deliver content progressively, not a required unit of payment. `SESSION_STREAM_UNITS` and commands such as `npm run session:pay` belong to the separate test app, not to this SDK's public API.
 
-### Which session actions send blockchain transactions?
+### Session transactions and network costs
 
 These are SDK operations or payment-plan actions; your app chooses command names and HTTP routes.
 
-| Action | Token or contract effect | Who pays transaction costs? |
+| Action | Token or contract effect | Who pays on-chain costs? |
 | --- | --- | --- |
 | Explicit `session.approve(amount)` | Calls the token contract to approve Permit2; no tokens move | Payer transport |
 | Open with Permit2 | Payer tokens go directly into escrow through Permit2 | Relayer |
 | Top-up or voucher merged with Permit2 funding | More payer tokens go directly into escrow | Relayer |
-| Voucher update, paid message, or streamed unit | Signed messages and stored accounting only | No blockchain transaction |
-| `sessionMethod.manager.settle(channelId)` | Escrow pays accepted cumulative authorization minus what was already settled | Relayer in the configured server example |
+| Voucher update, paid message, or streamed unit | Uses off-chain signatures and stored accounting | No on-chain transaction |
+| `sessionMethod.manager.settle(channelId)` | Escrow pays accepted cumulative voucher amount minus what was already settled | Relayer in the configured server example |
 | Cooperative close | Escrow pays any additional agreed amount and refunds the remainder | Relayer in the configured server example |
 | `session.force('requestClose', channelId)` | Starts the payer's waiting period; no refund yet | Payer transport |
 | `session.force('withdraw', channelId)` | After the waiting period, refunds the unsettled remainder to the original payer | Payer transport |
-| `sessionMethod.manager.reconcile(channelId)` | Checks a known operation and may update stored accounting; no new transfer | No new blockchain transaction |
+| `sessionMethod.manager.reconcile(channelId)` | Checks an existing submission and may update stored accounting | No new on-chain transaction |
 
-Use a payer transport for approval and forced recovery, and the configured relayer transport for sponsored server operations. `session.approve(amount)` is an explicit transaction helper; the app decides whether approval is needed and can pass `'0'` to revoke. It does not automatically skip an unchanged allowance. Permit2 funding consumes a one-time nonce on successful execution; token allowance is stored separately in the token contract. For direct hash funding instead, the payer funds the channel and pays transaction costs.
+Use a payer transport for approval and forced recovery, and the configured relayer transport for sponsored server transactions. Call `session.approve(amount)` when the payer needs to set an allowance, or pass `'0'` to revoke it. The helper sends a token approval transaction even if the allowance is already set to that amount. Successful Permit2 funding consumes a one-time nonce. The token contract tracks the allowance separately.
 
 ### Session accounting example
 
@@ -493,21 +494,21 @@ The app chooses the final close amount and obtains the payer's signature. The SD
 
 **Your app supplies storage; the SDK supplies the payment-accounting logic.** The SDK does not automatically create `.data/session/server.json` or `client.json`.
 
-- **On-chain:** channel funding, settled totals, forced-close requests, and finalization. Token contracts record balances and transfers. Individual usage debits are not separate blockchain transactions.
-- **Server store supplied by the app:** accepted vouchers, `spent`, observed deposit/settlement totals, used request IDs, funding records, and pending settlement/close operations. The SDK reads and updates these through `Store.AtomicStore`.
-- **Client storage supplied by the app:** channel ID, deployment binding, exact pending signed credentials, transaction hashes, and the latest receipt. The app must decide when and how to save these.
+- **On-chain:** channel funding, settled totals, forced-close requests, and finalization. Token contracts record balances and transfers. Individual usage debits are tracked off-chain.
+- **Server store supplied by the app:** accepted vouchers, `spent`, observed deposit and settlement totals, used request IDs, and pending funding, settlement, or close records with known transaction hashes. The SDK reads and updates these through `Store.AtomicStore`.
+- **Client storage supplied by the app:** channel ID, deployment binding, exact pending signed credentials, any known transaction hashes, and the latest receipt. The app decides when and how to save these.
 - **Product records supplied by the app:** orders, message bodies, delivery results, business idempotency keys, and any response cache.
 
 The local test app uses JSON journals in `.data/session`. Those filenames and its `jq` inspection commands are app features. A production deployment needs a store appropriate for its process and recovery model. `Store.memory()` loses records on restart and is suitable only where that loss is acceptable, such as disposable tests. Multiple workers need a shared atomic store.
 
 ### Session recovery and record cleanup
 
-- Call `sessionMethod.manager.reconcile(channelId)` for a known uncertain settlement or close. For saved sponsored funding, use `manager.reconcileFunding(request, channelId, funding)`; see the integration guide for the required saved inputs. These checks do not broadcast a new payment or deliver content. Confirmed failures release the operation so the app can choose to retry; unknown results remain pending.
-- Preserve the exact funding authorization and submitted hash. Sponsored funding can be checked after its authorization expires. A missing hash requires operator investigation.
+- Call `sessionMethod.manager.reconcile(channelId)` after an uncertain settlement or close. For saved sponsored funding, use `manager.reconcileFunding(request, channelId, funding)` with the original signed funding data. These calls check existing submissions without sending a new transaction or delivering content. Confirmed failures release the operation so the app can choose to retry. Unknown results remain pending.
+- Retain the exact signed funding authorization and known transaction hash. The server can verify a saved funding transaction even after the permit expires. If the server never recorded a hash, investigate the relayer's wallet.
 - A service debit is persisted before delivery. If delivery fails afterward, the app must reconcile the service result or recover its cached response. A new signed request is a new service attempt; an `Idempotency-Key` header alone does not bypass billing.
 - For payer recovery, request forced close, wait until the on-chain close timestamp plus the contract's grace period, then withdraw the unsettled remainder. The merchant may settle during the waiting period. The built-in adapter cannot automatically confirm external forced withdrawal in server accounting; that needs a custom `confirmedChannel` adapter at the required confirmation depth.
 - Keep a deployment binding with saved client state: `session.stateBinding({ serverUrl, recipient, payer })`. Reject saved state when it no longer matches the configured wallets, token, network, and escrow.
-- For explicit approval and forced recovery, use `beforeSubmit` to save a pending reservation after simulation and `onSubmitted(hash)` to save the hash before waiting for confirmation. If the result is uncertain, retain those records instead of starting another transaction.
+- For explicit approval and forced recovery, use `beforeSubmit` to save a pending reservation after simulation and `onSubmitted(hash)` to save the transaction hash before waiting for confirmation. If the outcome is uncertain, retain those records and check the original transaction before retrying.
 - Request records are capped by `maxIdempotencyRecords` (default **10,000 per channel**). At the limit, new records fail before charging. Once the channel is closed and `requestRetentionMs` has elapsed (default **24 hours**), schedule `manager.pruneRequests(channelId)` to remove expired records in batches. Active records are retained; the closed-channel marker remains so cleanup cannot reopen the channel.
 
 ## Challenge lifetime and storage limits
