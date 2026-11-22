@@ -50,6 +50,7 @@ export function session(parameters: SessionParameters) {
       S.assertClientPolicy(plan, policy)
       if ('type' in plan && !(request.methodDetails.credentialTypes ?? ['hash']).includes(plan.type)) throw new Error('Session credential type not advertised.')
       if (resume && (!('channelId' in plan) || plan.channelId !== resume || plan.action === 'open' || (plan.action === 'voucher' && plan.deposit?.action === 'open'))) throw new Error('Resume channel mismatch.')
+      if (plan.action === 'open') S.assertOpeningPlan(request, plan)
       if ('channelId' in plan && plan.action !== 'open' && !(plan.action === 'voucher' && plan.deposit?.action === 'open')) {
         const current = await readChannel(plan.channelId, plan.action === 'topUp' || plan.action === 'close', plan.action !== 'topUp' || plan.type === 'hash')
         const funding = plan.action === 'voucher' ? plan.deposit : undefined
@@ -62,16 +63,21 @@ export function session(parameters: SessionParameters) {
       }
       S.assertClientPolicy(plan, policy)
       if (typeof wallet.signRequest !== 'function') throw new Error('Session wallet must support request signing.')
-      const payload = S.PayloadSchema.parse(await wallet.createPayload(request, plan, policy))
-      if ('type' in payload && !(request.methodDetails.credentialTypes ?? ['hash']).includes(payload.type)) throw new Error('Session credential type not advertised.')
-      if ('cumulativeAmount' in payload && BigInt(payload.cumulativeAmount) > BigInt(P.Uint128Schema.parse(parameters.maxCumulativeAmount))) throw new Error('Voucher exceeds client cumulative limit.')
-      if (request.methodDetails.channelId && payload.channelId !== request.methodDetails.channelId) throw new Error('Resume channel mismatch.')
-      if (payload.action !== plan.action || ('channelId' in plan && payload.channelId !== plan.channelId) ||
-          ('cumulativeAmount' in plan && (!('cumulativeAmount' in payload) || payload.cumulativeAmount !== plan.cumulativeAmount))) throw new Error('Wallet did not execute the approved payment plan.')
-      S.assertClientPolicy(plan, policy)
-      const authorized = await authorizeSessionRequest({ ...challenge, request }, payload, data => wallet.signRequest(data, payload.action))
-      S.assertClientPolicy(plan, policy)
-      return Credential.serialize(Credential.from({ challenge, payload: authorized, source: P.formatSource(parameters.payer, request.methodDetails.chainId) }))
+      const serialize = async (input: S.Payload) => {
+        const payload = S.PayloadSchema.parse(input)
+        if ('type' in payload && !(request.methodDetails.credentialTypes ?? ['hash']).includes(payload.type)) throw new Error('Session credential type not advertised.')
+        if ('cumulativeAmount' in payload && BigInt(payload.cumulativeAmount) > BigInt(P.Uint128Schema.parse(parameters.maxCumulativeAmount))) throw new Error('Voucher exceeds client cumulative limit.')
+        if (resume && payload.channelId !== resume) throw new Error('Resume channel mismatch.')
+        if (payload.action !== plan.action || ('channelId' in plan && payload.channelId !== plan.channelId) ||
+            ('cumulativeAmount' in plan && (!('cumulativeAmount' in payload) || payload.cumulativeAmount !== plan.cumulativeAmount))) throw new Error('Wallet did not execute the approved payment plan.')
+        S.assertClientPolicy(plan, policy)
+        const authorized = await authorizeSessionRequest({ ...challenge, request }, payload, data => wallet.signRequest(data, payload.action))
+        S.assertClientPolicy(plan, policy)
+        return Credential.serialize(Credential.from({ challenge, payload: authorized, source: P.formatSource(parameters.payer, request.methodDetails.chainId) }))
+      }
+      let credential: string | undefined
+      const payload = await wallet.createPayload(request, plan, policy, async funded => { credential = await serialize(funded) })
+      return credential ?? await serialize(payload)
     },
   })
 }

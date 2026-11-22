@@ -25,8 +25,9 @@ See [protocol integration](PROTOCOL.md) for configuration examples.
    - `transaction`: signs a TRON protobuf transaction envelope; the server verifies
      its signature, owner, token, exact transfer calldata and absence of attached
      native value before broadcasting it.
-   - `hash`: broadcasts the token transfer and returns its confirmed transaction
-     hash. This format has weaker payer/challenge binding.
+   - `hash`: with explicit opt-in, broadcasts the token transfer and returns its
+     confirmed hash. The server uses the application's order authorization and
+     verifies the receipt against the expected payer.
 5. The client retries with `Authorization: Payment ...`. Mppx verifies the
    challenge HMAC and route binding; the SDK checks the stored auth-params.
 6. The server validates the credential and simulates server-submitted calls. It

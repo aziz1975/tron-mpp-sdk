@@ -236,6 +236,86 @@ describe('session client policy before wallet execution', () => {
     expect(Credential.deserialize(header).payload).toMatchObject({ action: 'open', cumulativeAmount: '100' })
     expect(t.signTypedData).toHaveBeenCalledTimes(2); expect(t.send).toHaveBeenCalledTimes(2)
   })
+  it('rejects an undersized opening before either the client or the direct wallet can sign or broadcast', async () => {
+    const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
+    f.request.amount = '10'
+    const plan = { action: 'open', type: 'hash', deposit: '9', cumulativeAmount: '1' } as const
+    const method = clientSession({ chainIds: [chainId], currencies: [token], escrowContracts: [escrow], recipients: [recipient], payer: account.address,
+      maxUnitAmount: '10', maxCumulativeAmount: '100', wallet, preparePayment: async () => plan })
+    const execute = vi.spyOn(wallet, 'createPayload')
+    await expect(method.createCredential({ challenge: f.challenge() })).rejects.toThrow(/one service unit/)
+    expect(execute).not.toHaveBeenCalled()
+    await expect(wallet.createPayload(f.request, plan, { maxCumulativeAmount: '100' })).rejects.toThrow(/one service unit/)
+    await expect(wallet.open(f.request, plan.deposit, plan.cumulativeAmount)).rejects.toThrow(/one service unit/)
+    expect(t.signTypedData).not.toHaveBeenCalled()
+    expect(t.send).not.toHaveBeenCalled()
+  })
+  it.each(['receipt', 'ambiguous broadcast', 'request signing'] as const)('recovers a wallet-funded opening across wallet instances after failing at %s', async failure => {
+    const f = fixture(), t = transport(), fundingStore = Store.memory(), wallet = createSessionWallet(t, escrow, { fundingStore })
+    const plan = { action: 'open', type: 'hash', deposit: '200', cumulativeAmount: '100' } as const
+    const error = new Error('temporarily unavailable')
+    if (failure === 'receipt') wallet.adapter.verifyTransaction = vi.fn(async () => { throw error })
+    if (failure === 'request signing') {
+      wallet.adapter.verifyTransaction = vi.fn(async () => {})
+      wallet.signRequest = vi.fn(async () => { throw error })
+    }
+    if (failure === 'ambiguous broadcast') t.send = vi.fn(async (to, _data, _from, onPrepared) => {
+      if (to === escrow) {
+        await onPrepared?.(hash)
+        throw error
+      }
+      return hash
+    })
+    const pending = await client(f, wallet, plan).createCredential({ challenge: f.challenge() }).catch(error => error)
+    expect(pending).toBeInstanceOf(P.SessionFundingPendingError)
+    expect(pending).toMatchObject({ cause: error, hash })
+    const restarted = createSessionWallet(t, escrow, { fundingStore })
+    restarted.adapter.verifyTransaction = vi.fn(async () => {})
+    const header = await client(f, restarted, plan).createCredential({ challenge: { ...f.challenge(), id: 'fresh-challenge' } })
+    expect(Credential.deserialize(header).payload).toMatchObject({ action: 'open', channelId: pending.channelId, hash })
+    expect(restarted.adapter.verifyTransaction).toHaveBeenCalledWith(hash, 'open', pending.channelId, plan.deposit)
+    expect(t.send).toHaveBeenCalledTimes(2)
+    expect(t.signTypedData).toHaveBeenCalledTimes(2)
+  })
+  it('allows a new funding attempt after a confirmed revert', async () => {
+    const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
+    const verify = vi.fn().mockRejectedValueOnce(new P.TransactionRevertedError(hash)).mockResolvedValue(undefined)
+    wallet.adapter.verifyTransaction = verify
+    await expect(wallet.open(f.request, '200', '100')).rejects.toMatchObject({ code: 'transaction-reverted', hash })
+    await expect(wallet.open(f.request, '200', '100')).resolves.toMatchObject({ action: 'open', hash })
+    expect(verify.mock.calls[0]?.[2]).not.toBe(verify.mock.calls[1]?.[2])
+    expect(t.send).toHaveBeenCalledTimes(4)
+  })
+  it('reserves a pending opening across concurrent wallet calls before approval or broadcast', async () => {
+    const f = fixture(), t = transport(), fundingStore = Store.memory()
+    const first = createSessionWallet(t, escrow, { fundingStore })
+    const second = createSessionWallet(t, escrow, { fundingStore })
+    let signalBroadcast!: () => void
+    let finishBroadcast!: () => void
+    const started = new Promise<void>(resolve => { signalBroadcast = resolve })
+    const waiting = new Promise<void>(resolve => { finishBroadcast = resolve })
+    t.send = vi.fn(async to => {
+      if (to === escrow) { signalBroadcast(); await waiting }
+      return hash
+    })
+    first.adapter.verifyTransaction = vi.fn(async () => {})
+    const funding = first.open(f.request, '200', '100')
+    await started
+    try {
+      await expect(second.open(f.request, '200', '100')).rejects.toBeInstanceOf(P.SessionFundingPendingError)
+      expect(t.send).toHaveBeenCalledTimes(2)
+    } finally { finishBroadcast() }
+    await expect(funding).resolves.toMatchObject({ action: 'open', hash })
+  })
+  it('recovers the original top-up after a receipt RPC failure', async () => {
+    const f = fixture(), t = transport(), wallet = createSessionWallet(t, escrow)
+    const verify = vi.fn().mockRejectedValueOnce(new Error('receipt unavailable')).mockResolvedValue(undefined)
+    wallet.adapter.verifyTransaction = verify
+    await expect(wallet.topUp(f.request, id, '10')).rejects.toMatchObject({ channelId: id, hash })
+    await expect(wallet.topUp(f.request, id, '10')).resolves.toMatchObject({ action: 'topUp', channelId: id, hash })
+    expect(verify).toHaveBeenLastCalledWith(hash, 'topUp', id, '10')
+    expect(t.send).toHaveBeenCalledTimes(2)
+  })
   it.each(['permit2', 'authorization'] as const)('signs a prepared %s opening without broadcasting on the client', async type => {
     const f = fixture(), signed = await funding(f, type), t = transport(), wallet = createSessionWallet(t, escrow, { authorizationDomain: domain })
     const plan = S.PaymentPlanSchema.parse({ ...signed, channelId: id, cumulativeAmount: '100' })

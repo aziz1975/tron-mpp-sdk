@@ -116,7 +116,7 @@ describe('TRC-20 charge', () => {
     const a = adapter()
     const store = Store.memory()
     const server = Mppx.create({ secretKey: '0123456789abcdef0123456789abcdef', methods: [serverTron.charge({
-      adapter: a, chainId, currency: token, recipient, credentialTypes: ['hash'], store,
+      adapter: a, chainId, currency: token, recipient, credentialTypes: ['hash'], authorizeHash: () => account.address, store,
     })] })
     const route = server.charge({ amount: '100' })
     const initial = await route(new Request('https://api.test/paid'))
@@ -213,14 +213,14 @@ describe('TRC-20 charge', () => {
     if (receipt.status === 'fulfilled') expect(Receipt.deserialize(Receipt.serialize(receipt.value))).toMatchObject({ chainId, challengeId: c.id, externalId: 'invoice-1' })
   })
   it('rejects hash reuse across two challenges', async () => {
-    const method = serverCharge({ adapter: adapter(), chainId, currency: token, recipient, credentialTypes: ['hash'] })
+    const method = serverCharge({ adapter: adapter(), chainId, currency: token, recipient, credentialTypes: ['hash'], authorizeHash: () => account.address })
     await method.verify(verification(challenge(), { type: 'hash', hash }))
     await expect(method.verify(verification({ ...challenge(), id: 'other' }, { type: 'hash', hash }))).rejects.toThrow(/consumed/)
   })
   it('allows a valid payment retry after hash verification fails', async () => {
     const a = adapter()
     a.verify = vi.fn().mockRejectedValueOnce(new Error('Unconfirmed')).mockResolvedValue({ hash })
-    const method = serverCharge({ adapter: a, chainId, currency: token, recipient, credentialTypes: ['hash'] })
+    const method = serverCharge({ adapter: a, chainId, currency: token, recipient, credentialTypes: ['hash'], authorizeHash: () => account.address })
     const v = verification(challenge(), { type: 'hash', hash })
     await expect(method.verify(v)).rejects.toThrow(/Unconfirmed/)
     await expect(method.verify(v)).resolves.toMatchObject({ reference: hash })

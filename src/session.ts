@@ -5,8 +5,8 @@ import { TransactionOutcomeUnknownError, TransactionRevertedError } from './prot
 import * as P from './protocol/Primitives.js'
 import type * as S from './protocol/Session.js'
 import { session as clientSession, type SessionParameters } from './client/Session.js'
-import { createSessionAdapter, createSessionRelayer, createSessionWallet, escrowAbi } from './tronweb/Session.js'
-import { waitForReceipt, type ConfirmationOptions, type TronTransport } from './tronweb/Transport.js'
+import { createSessionAdapter, createSessionRelayer, createSessionWallet, escrowAbi, type SessionWalletOptions } from './tronweb/Session.js'
+import { waitForReceipt, type TronTransport } from './tronweb/Transport.js'
 
 export type SubmissionHooks = {
   /** Persist a reservation after simulation succeeds and before broadcasting. */
@@ -14,16 +14,17 @@ export type SubmissionHooks = {
   /** Persist the hash before waiting for confirmation. */
   onSubmitted?: (hash: Hex) => void | Promise<void>
 }
-export type ConfiguredSessionOptions = ConfirmationOptions & { currency: string; permit2Contract: string }
+export type ConfiguredSessionOptions = SessionWalletOptions & { currency: string; permit2Contract: string }
 const views = parseAbi([
   'function PERMIT2() view returns (address)', 'function allowedTokens(address) view returns (bool)',
   'function domainSeparator() view returns (bytes32)', 'function DOMAIN_SEPARATOR() view returns (bytes32)',
   'function approve(address,uint256) returns (bool)',
 ])
 
-/** Node.js session operations bound to the escrow embedded during the SDK build. */
+/** Node.js session operations bound to the embedded escrow for the transport's chain. */
 export function createConfiguredSession(transport: TronTransport, options: ConfiguredSessionOptions) {
-  const escrow = getSessionEscrowAddress(), chainId = P.ChainIdSchema.parse(transport.chainId)
+  const chainId = P.ChainIdSchema.parse(transport.chainId)
+  const escrow = getSessionEscrowAddress(chainId)
   const currency = P.TokenAddressSchema.parse(options.currency), permit2 = P.normalizeAddress(options.permit2Contract)
   const adapter = createSessionAdapter(transport, escrow, options)
   let wallet: ReturnType<typeof createSessionWallet> | undefined

@@ -5,12 +5,20 @@ import * as P from '../protocol/Primitives.js'
 import { paymentBoundary, TransactionNotSubmittedError, TransactionOutcomeUnknownError, TransactionRevertedError } from '../protocol/Errors.js'
 import { assertIssuedChallenge, challengeTransport } from './Challenges.js'
 
+export type HashChargeContext = {
+  challenge: C.Challenge
+  hash: Hex
+  capturedRequest?: Method.CapturedRequest | undefined
+}
+
 export type ChargeParameters = {
   adapter: C.Adapter
   chainId: number
   currency: string
   recipient: string
   credentialTypes?: readonly C.CredentialType[]
+  /** Authenticate the caller and bind this hash to the application's order. Return the expected payer, or null to reject. */
+  authorizeHash?: (context: HashChargeContext) => string | null | Promise<string | null>
   permit2?: { address: string; spender: string }
   authorizationDomain?: P.AuthorizationDomain
   store?: Store.AtomicStore
@@ -39,7 +47,9 @@ const rejected = (reason: string) => new Errors.VerificationFailedError({ reason
 export function charge(parameters: ChargeParameters): ChargeMethod {
   const adapter = parameters.adapter
   if (adapter.chainId !== parameters.chainId) throw new Error('Adapter chainId mismatch.')
-  const credentialTypes = [...(parameters.credentialTypes ?? ['transaction', 'hash'])]
+  const credentialTypes = [...(parameters.credentialTypes ?? ['transaction'])]
+  const authorizeHash = parameters.authorizeHash
+  if (credentialTypes.includes('hash') && typeof authorizeHash !== 'function') throw new Error('Configure authorizeHash to authenticate hash charges and bind them to an order.')
   if (credentialTypes.includes('permit2') && !parameters.permit2) throw new Error('Configure a TRON Permit2 contract and spender.')
   if (credentialTypes.includes('authorization') && !parameters.authorizationDomain) throw new Error('Configure the EIP-3009 token domain.')
   const store = parameters.store ?? Store.memory()
@@ -126,11 +136,15 @@ export function charge(parameters: ChargeParameters): ChargeMethod {
             !P.isSameAddress(request.methodDetails.permit2Address, parameters.permit2.address) || !P.isSameAddress(request.methodDetails.spender, parameters.permit2.spender))) throw new Error('Untrusted Permit2 contract or spender.')
         const saved = await paymentBoundary(() => store.get(key))
         const previous = saved === null ? undefined : readJournal(saved)
-        // source is optional: EOA permits recover their signer, authorizations
-        // carry from, and signed transactions can recover their validated owner.
-        // Hash credentials need only the receipt's token/to/amount evidence.
+        // Hash credentials need an independently authenticated payer from the application.
         let payer: Address | undefined
-        if (credential.source !== undefined) payer = P.parseSource(credential.source, adapter.chainId)
+        if (payload.type === 'hash') {
+          C.assertChallengeActive(challenge)
+          const authorizedPayer = await paymentBoundary(async () => authorizeHash!({ challenge: structuredClone(challenge), hash: payload.hash, capturedRequest: envelope?.capturedRequest }))
+          if (!authorizedPayer) throw rejected('Transaction is not authorized for this order.')
+          payer = await paymentBoundary(async () => P.AddressSchema.parse(authorizedPayer))
+          if (credential.source !== undefined && P.parseSource(credential.source, adapter.chainId) !== payer) throw rejected('Hash charge payer mismatch.')
+        } else if (credential.source !== undefined) payer = P.parseSource(credential.source, adapter.chainId)
         else if (previous?.payer) payer = previous.payer
         else if (payload.type === 'authorization') payer = payload.from
         else if (payload.type === 'permit2') payer = await P.recoverSigner(C.permitTypedData(challenge, payload), payload.signature)

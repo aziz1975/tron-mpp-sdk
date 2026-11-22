@@ -1,4 +1,4 @@
-# tron-mpp-sdk
+# @trondao/tron-mpp-sdk
 
 Accept TRON **TRC-20 token payments with Permit2** through the Machine Payments Protocol (MPP). Payers sign typed payment authorizations, and a relayer submits sponsored transactions on-chain. The SDK supports two payment flows, called intents:
 
@@ -17,20 +17,22 @@ The SDK handles payment rules and verification. Your app chooses what to sell, s
 ## Install and connect to TRON
 
 ```sh
-npm install tron-mpp-sdk mppx viem
+npm install @trondao/tron-mpp-sdk mppx viem
 # Also install TronWeb if using the SDK's provided TRON integration.
-npm install tronweb
+npm install tronweb@^6.5.2
 ```
+
+For Node.js integrations using TronWeb, use a release supported by TronWeb 6.5.2 (`^22.23.4`, `^24.22.1`, or `>=26.12.1`).
 
 The package provides these entry points:
 
 | Import | Purpose |
 | --- | --- |
-| `tron-mpp-sdk` | Shared schemas, address helpers, chain IDs, signature helpers, and errors |
-| `tron-mpp-sdk/client` | Client payment methods and the Mppx HTTP client |
-| `tron-mpp-sdk/server` | Server payment methods, receipts, storage helpers, and session management |
-| `tron-mpp-sdk/tronweb` | Connect the payment methods to TronWeb wallets and nodes |
-| `tron-mpp-sdk/session` | Node.js session helpers using the escrow address embedded in the SDK build |
+| `@trondao/tron-mpp-sdk` | Shared schemas, address helpers, chain IDs, signature helpers, and errors |
+| `@trondao/tron-mpp-sdk/client` | Client payment methods and the Mppx HTTP client |
+| `@trondao/tron-mpp-sdk/server` | Server payment methods, receipts, storage helpers, and session management |
+| `@trondao/tron-mpp-sdk/tronweb` | Connect the payment methods to TronWeb wallets and nodes |
+| `@trondao/tron-mpp-sdk/session` | Node.js session helpers that select the embedded escrow for the transport's chain |
 
 ### Amounts, wallets, and networks
 
@@ -40,12 +42,19 @@ The package provides these entry points:
 - **A private key is not an address.** When an app configures a private key, the corresponding wallet signs. Your app owns key management and access control.
 - Addresses can be Base58Check (`T...`), `41`-prefixed hex, or 20-byte `0x` hex. The SDK compares the underlying account values. Use `toBase58Address` when displaying an address.
 
-Your app creates a wallet/node connection and passes it to the SDK:
+Your app configures `fullHost` on the TronWeb instance and passes the matching numeric `chainId` to `createTronWebTransport`. Use the same network for payer, merchant and relayer connections.
+
+| Network | TronWeb `fullHost` (TronGrid) | SDK `chainId` | SDK build `.env` key for Session |
+| --- | --- | --- | --- |
+| Nile testnet | `https://nile.trongrid.io` | `chains.nile` (`3448148188`) | `TRON_SESSION_ESCROW_ADDRESS_NILE` |
+| Mainnet | `https://api.trongrid.io` | `chains.mainnet` (`728126428`) | `TRON_SESSION_ESCROW_ADDRESS_MAINNET` |
+
+For example, configure a Nile payer transport as follows. To switch to Mainnet, change both values to the Mainnet pair above and use that network's token and Permit2 contracts.
 
 ```ts
 import { TronWeb } from 'tronweb'
-import { chains } from 'tron-mpp-sdk'
-import { createTronWebTransport } from 'tron-mpp-sdk/tronweb'
+import { chains } from '@trondao/tron-mpp-sdk'
+import { createTronWebTransport } from '@trondao/tron-mpp-sdk/tronweb'
 
 const walletTronWeb = new TronWeb({
   fullHost: 'https://nile.trongrid.io',
@@ -56,9 +65,7 @@ const payerTransport = createTronWebTransport(walletTronWeb, {
 })
 ```
 
-The same package supports configured TRON networks; there are no separate mainnet and Nile SDK packages. The **app must supply a node and chain ID for the intended network**, along with contracts deployed on that network. `TRON_FULL_HOST` is an app configuration convention, not an environment variable the SDK reads automatically. The SDK accepts an already configured TronWeb instance or a custom transport.
-
-The transport trusts its configured chain ID; it does not discover or independently verify the node's network. Changing only the node URL does not change the chain ID. For sessions, the embedded escrow address must also belong to the intended network; the current SDK embeds one address, not a registry of deployments by chain ID. See [session deployment configuration](#session-deployment-configuration).
+Charges and explicitly configured session adapters support both networks. The configured session helpers use the deployments embedded in the build. The example release configuration embeds Nile only. If your app reads `TRON_FULL_HOST` from its environment, pair that endpoint with the matching chain ID. The endpoint determines where reads and transactions go. The configured chain ID is used in payment challenges, typed-data signing, and escrow selection. The transport trusts the chain ID you pass. At startup, check the endpoint's [`eth_chainId`](https://developers.tron.network/reference/eth_chainid) and reject a mismatch before enabling payments. Expect `0xcd8690dc` for Nile or `0x2b6653dc` for Mainnet.
 
 ## Credential Types
 
@@ -70,6 +77,8 @@ Set `credentialTypes: ['permit2']` on the charge server, charge client, and sess
 | Session funding | A permit tied to the channel being opened or topped up | The escrow contract |
 
 In both flows, the payer grants a token allowance to the Permit2 contract before signing a permit. The relayer pays to submit the signed credential on-chain. The payer signs session vouchers separately, and settlement pays the merchant from escrow.
+
+Charges advertise `transaction` by default. To use `hash` charges, enable `hash` in `credentialTypes` on both sides and provide the server's `authorizeHash` callback. Authenticate the caller and check that the submitted hash belongs to the order before returning the expected payer address. See the [charge integration guide](docs/PROTOCOL.md#charge-client).
 
 ## Charge: one payment for one request
 
@@ -129,9 +138,9 @@ sequenceDiagram
 These are integration snippets, not a complete server. The app supplies the wallet connections, token and wallet addresses, HTTP routing, server secret, and storage connection used below. `redisWithAtomicUpdate` represents a Redis connection implementing the atomic operations required by `Store.redis`; see the [integration guide](docs/PROTOCOL.md).
 
 ```ts
-import { Mppx, Store, tron } from 'tron-mpp-sdk/server'
-import { chains } from 'tron-mpp-sdk'
-import { createChargeAdapter, createTronWebTransport } from 'tron-mpp-sdk/tronweb'
+import { Mppx, Store, tron } from '@trondao/tron-mpp-sdk/server'
+import { chains } from '@trondao/tron-mpp-sdk'
+import { createChargeAdapter, createTronWebTransport } from '@trondao/tron-mpp-sdk/tronweb'
 
 const adapter = createChargeAdapter(
   createTronWebTransport(relayerTronWeb, { chainId: chains.nile }),
@@ -164,9 +173,9 @@ The SDK verifies the 1-USDT payment, assuming a six-decimal token. Your app supp
 ### Charge client example
 
 ```ts
-import { Mppx, tron } from 'tron-mpp-sdk/client'
-import { chains } from 'tron-mpp-sdk'
-import { createChargeAdapter, createTronWebTransport } from 'tron-mpp-sdk/tronweb'
+import { Mppx, tron } from '@trondao/tron-mpp-sdk/client'
+import { chains } from '@trondao/tron-mpp-sdk'
+import { createChargeAdapter, createTronWebTransport } from '@trondao/tron-mpp-sdk/tronweb'
 
 const adapter = createChargeAdapter(
   createTronWebTransport(walletTronWeb, { chainId: chains.nile }),
@@ -340,19 +349,20 @@ This shows `createConfiguredSession(...).serverAdapter(payeeSigner)`, where the 
 
 Deploy `TronPaymentChannel` from the separate [contract repository](../tron-mpp-sdk-contract/README.md), or use a compatible existing deployment on the intended network. Configure its token allowlist and Permit2 contract. Its close grace period must be at least 900 seconds.
 
-**For SDK maintainers building a release:** set the deployed escrow in the SDK repository's `.env` before building:
+**For SDK maintainers building a release:** set each deployed escrow in the SDK repository's `.env` before building. Rename the old `TRON_SESSION_ESCROW_ADDRESS` key to `TRON_SESSION_ESCROW_ADDRESS_NILE` if it contains your Nile deployment.
 
 ```dotenv
-TRON_SESSION_ESCROW_ADDRESS=<deployed escrow address>
+TRON_SESSION_ESCROW_ADDRESS_NILE=<deployed Nile escrow address>
+TRON_SESSION_ESCROW_ADDRESS_MAINNET=<deployed Mainnet escrow address>
 ```
 
 ```sh
 npm run build
 ```
 
-The build validates and embeds the public address. A missing, invalid, or zero address fails the build, including when building only to use charge. `npm pack` and `npm publish` also run the build through `prepack`. The release build environment therefore needs this configuration. `.env` files are excluded from the package.
+If a network has no deployment, leave nothing after its `=`. The build requires at least one address, validates every supplied address, and embeds the public addresses by chain ID. Invalid or zero addresses fail the build. `npm pack` and `npm publish` also run this build through `prepack`. The package excludes `.env` files.
 
-**For apps using a built package:** use `createConfiguredSession` from `tron-mpp-sdk/session`. It uses the embedded escrow; it does not read an escrow address from the app's `.env` or from `node_modules` at runtime. The app supplies the transport, token, and Permit2 address. Changing a published embedded deployment requires a rebuilt SDK release; restart apps after changing a local SDK build.
+**For apps using a built package:** pass the transport, token (`currency`), and Permit2 address to `createConfiguredSession` from `@trondao/tron-mpp-sdk/session`. The helper uses `transport.chainId` to select the address embedded for that chain. If the build has no escrow for that chain, session creation throws. The app needs no escrow environment variables. Rebuild the SDK and restart the app after changing an embedded address. Updating an address in a published package requires a new SDK release.
 
 Call `session.inspect()` before using the configured deployment. It checks the escrow's Permit2 address, token allowlist, grace period, and both signing domains against the configured chain ID. It does not independently prove the RPC node's network. Lower-level APIs accepting an explicit escrow remain available for existing integrations.
 
@@ -361,10 +371,10 @@ Call `session.inspect()` before using the configured deployment. It checks the e
 The app supplies `relayerTronWeb`, `merchantTronWeb`, `tokenAddress`, `merchantAddress`, `permit2Address`, and `redisWithAtomicUpdate`. The merchant wallet must match `merchantAddress`. This example uses automatic one-unit billing; app-controlled opening and streaming require the explicit metering mode described next.
 
 ```ts
-import { Mppx, Store, tron } from 'tron-mpp-sdk/server'
-import { chains } from 'tron-mpp-sdk'
-import { createTronWebTransport } from 'tron-mpp-sdk/tronweb'
-import { createConfiguredSession } from 'tron-mpp-sdk/session'
+import { Mppx, Store, tron } from '@trondao/tron-mpp-sdk/server'
+import { chains } from '@trondao/tron-mpp-sdk'
+import { createTronWebTransport } from '@trondao/tron-mpp-sdk/tronweb'
+import { createConfiguredSession } from '@trondao/tron-mpp-sdk/session'
 
 const relayerTransport = createTronWebTransport(relayerTronWeb, {
   chainId: chains.nile,
@@ -422,15 +432,15 @@ Mppx handles management responses such as `HEAD` voucher updates, top-ups, and c
 | `session.force(action, channelId, hooks)` | Submit payer forced-close or withdrawal operations |
 | `session.stateBinding(...)` | Identify which deployment and wallets a saved client state belongs to |
 
-For tooling, `getSessionEscrowAddress()` from `tron-mpp-sdk/config` returns the embedded address without reading runtime environment variables. App session flows should use the configured session helper so signing, policy, and transaction targets use the same deployment.
+For tooling, `getSessionEscrowAddress(chainId)` from `@trondao/tron-mpp-sdk/config` returns the embedded address for that chain. Pass `chains.nile` or `chains.mainnet` explicitly. The legacy no-argument call selects Nile. App session flows should use the configured session helper so signing, policy, and transaction targets use the same deployment.
 
 ### Session client example
 
 The app supplies `payerTransport`, token, Permit2, merchant and payer addresses, and a `choosePaymentPlan` callback implementing `preparePayment`. For Permit2 funding plans, the `authorization` field holds the unsigned permit data. On open, use `session.computeChannelId(...)` with the same payer, payee, salt, and optional authorized signer as the plan. The SDK validates the plan before signing. See the [integration guide](docs/PROTOCOL.md#sessions) for funding details.
 
 ```ts
-import { Mppx } from 'tron-mpp-sdk/client'
-import { createConfiguredSession } from 'tron-mpp-sdk/session'
+import { Mppx } from '@trondao/tron-mpp-sdk/client'
+import { createConfiguredSession } from '@trondao/tron-mpp-sdk/session'
 
 const session = createConfiguredSession(payerTransport, {
   currency: tokenAddress,
@@ -503,6 +513,7 @@ The local test app uses JSON journals in `.data/session`. Those filenames and it
 
 ### Session recovery and record cleanup
 
+- For wallet-funded opens and top-ups, provide an atomic `fundingStore` to `createSessionWallet` or `createConfiguredSession` to retain pending funding across restarts. On `SessionFundingPendingError`, retain its `channelId` and any `hash`. Retry the same funding plan with an active challenge and the same store. The wallet checks the saved submission before creating the credential. Once it returns a credential, save and reuse it if the HTTP submission fails.
 - Call `sessionMethod.manager.reconcile(channelId)` after an uncertain settlement or close. For saved sponsored funding, use `manager.reconcileFunding(request, channelId, funding)` with the original signed funding data. These calls check existing submissions without sending a new transaction or delivering content. Confirmed failures release the operation so the app can choose to retry. Unknown results remain pending.
 - Retain the exact signed funding authorization and known transaction hash. The server can verify a saved funding transaction even after the permit expires. If the server never recorded a hash, investigate the relayer's wallet.
 - A service debit is persisted before delivery. If delivery fails afterward, the app must reconcile the service result or recover its cached response. A new signed request is a new service attempt; an `Idempotency-Key` header alone does not bypass billing.
@@ -529,9 +540,9 @@ npm run test:package
 ```
 
 - `check` checks TypeScript.
-- `test` runs the automated SDK tests using a deterministic test escrow address; the source tests do not need the SDK `.env`.
-- `build` reads the SDK `.env`, validates the escrow address, and builds the package.
-- `test:package` packs and extracts the real package, checks that `.env` files are excluded, and checks installed and bundled consumers with a conflicting runtime escrow variable. It makes no chain calls.
+- `test` runs the automated SDK tests with deterministic escrow addresses. The source tests do not need the SDK `.env`.
+- `build` reads the SDK `.env`, validates the escrow addresses, and builds the package.
+- `test:package` packs and extracts the real package, checks that `.env` files are excluded, and checks escrow selection in installed and bundled consumers with conflicting runtime environment variables. It makes no chain calls.
 
 Changing the SDK code or embedded escrow requires rebuilding and restarting apps using that build. Contract tests and TRON compilation live in the separate [contract repository](../tron-mpp-sdk-contract/README.md).
 

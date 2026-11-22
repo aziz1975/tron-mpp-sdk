@@ -2,7 +2,7 @@ import { charge } from './Charge.js'
 import { session } from './Session.js'
 
 export { Expires, Mppx, Store } from 'mppx/server'
-export type { ChargeParameters, ChargeMethod } from './Charge.js'
+export type { ChargeParameters, ChargeMethod, HashChargeContext } from './Charge.js'
 export { SessionManager, needVoucherEvent, receiptEvent } from './Session.js'
 export type { SessionParameters, SessionState } from './Session.js'
 

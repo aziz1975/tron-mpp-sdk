@@ -4,12 +4,17 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFil
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parseEnv } from 'node:util'
 import { build } from 'tsup'
-import { getSessionEscrowAddress } from '../dist/config.js'
+import { chains, normalizeAddress } from '../dist/index.js'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-const expected = getSessionEscrowAddress()
+const env = parseEnv(readFileSync(join(root, '.env'), 'utf8'))
+const expected = [
+  [chains.nile, env.TRON_SESSION_ESCROW_ADDRESS_NILE],
+  [chains.mainnet, env.TRON_SESSION_ESCROW_ADDRESS_MAINNET],
+].map(([chainId, address]) => [chainId, address?.trim() ? normalizeAddress(address.trim()) : null])
 const work = mkdtempSync(join(tmpdir(), 'tron-sdk-package-'))
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', work, '--cache', join(work, 'npm-cache')], { cwd: root, encoding: 'utf8' }))[0]
 assert(!packed.files.some(({ path }) => /(^|\/)\.env(?:\.|$)/.test(path)), 'The npm package must not include .env files')
@@ -26,19 +31,27 @@ for (const name of Object.keys({ ...manifest.dependencies, ...manifest.peerDepen
 const entry = join(consumer, 'check.mjs')
 writeFileSync(entry, `
 import assert from 'node:assert/strict'
-import { getSessionEscrowAddress } from 'tron-mpp-sdk/config'
-import { createConfiguredSession } from 'tron-mpp-sdk/session'
-assert.equal(getSessionEscrowAddress(), ${JSON.stringify(expected)})
-const session = createConfiguredSession({ chainId: 3448148188 }, {
+import { getSessionEscrowAddress } from ${JSON.stringify(`${manifest.name}/config`)}
+import { createConfiguredSession } from ${JSON.stringify(`${manifest.name}/session`)}
+const options = {
   currency: '0x3333333333333333333333333333333333333333',
   permit2Contract: '0x5555555555555555555555555555555555555555',
-})
-assert.equal(session.metadata.escrowContract, ${JSON.stringify(expected)})
-console.log('Embedded escrow works without SDK or app .env files')
+}
+for (const [chainId, escrowContract] of ${JSON.stringify(expected)}) {
+  if (escrowContract === null) {
+    const error = new RegExp('No session escrow configured for TRON chain ID ' + chainId)
+    assert.throws(() => getSessionEscrowAddress(chainId), error)
+    assert.throws(() => createConfiguredSession({ chainId }, options), error)
+    continue
+  }
+  assert.equal(getSessionEscrowAddress(chainId), escrowContract)
+  assert.deepEqual(createConfiguredSession({ chainId }, options).metadata, { chainId, escrowContract })
+}
+console.log('Escrow selection uses the embedded addresses without SDK or app .env files')
 `)
 const run = file => execFileSync(process.execPath, [file], {
   cwd: work,
-  env: { ...process.env, TRON_SESSION_ESCROW_ADDRESS: 'invalid-runtime-value' },
+  env: { ...process.env, TRON_SESSION_ESCROW_ADDRESS_NILE: 'invalid-runtime-value', TRON_SESSION_ESCROW_ADDRESS_MAINNET: 'invalid-runtime-value' },
   encoding: 'utf8',
 })
 process.stdout.write(`Installed package: ${run(entry)}`)

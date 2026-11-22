@@ -56,6 +56,18 @@ export function assertClientPolicy(plan: PaymentPlan | undefined, policy: Client
   if (plan && 'cumulativeAmount' in plan && BigInt(plan.cumulativeAmount) > limit) throw new InvalidRequestError('Voucher exceeds client cumulative limit.')
   if (policy.expires !== undefined && (!Number.isFinite(Date.parse(policy.expires)) || Date.parse(policy.expires) <= Date.now())) throw new InvalidRequestError('Session challenge expired or expiry is invalid.')
 }
+
+function assertOpeningDeposit(request: Request, deposit: string, initialAmount: string): void {
+  const funded = BigInt(P.Uint128Schema.parse(deposit))
+  const voucher = BigInt(P.Uint128Schema.parse(initialAmount))
+  if (funded === 0n || funded < BigInt(request.amount)) throw new InvalidRequestError('Deposit does not cover one service unit.')
+  if (voucher > funded) throw new InvalidRequestError('Initial voucher exceeds deposit.')
+}
+
+export function assertOpeningPlan(request: Request, plan: Extract<PaymentPlan, { action: 'open' }>): void {
+  const deposit = plan.type === 'hash' ? plan.deposit : 'value' in plan.authorization ? plan.authorization.value : plan.authorization.permitted.amount
+  assertOpeningDeposit(request, deposit, plan.cumulativeAmount)
+}
 // Optional for trusted low-level accounting calls; required by the HTTP verifier.
 const RequestAuthorizationFields = { requestAuthorization: z.optional(z.object({ nonce: P.Bytes32Schema, signature: P.ContractSignatureSchema })) }
 const VoucherFields = { ...RequestAuthorizationFields, channelId: P.Bytes32Schema, cumulativeAmount: P.Uint128Schema, signature: P.ContractSignatureSchema }
@@ -113,7 +125,9 @@ export type Wallet = {
   /** Sign the off-chain SessionRequest proof using the voucher signer, or funder for top-ups. */
   signRequest: (data: P.TypedData, action: Payload['action']) => Promise<Hex>
   /** Execute exactly this validated unsigned plan; enforce policy before signing or funding. */
-  createPayload: (request: Request, plan: PaymentPlan, policy: ClientPolicy) => Promise<Payload>
+  createPayload: (request: Request, plan: PaymentPlan, policy: ClientPolicy,
+    /** Finalize the credential before releasing any saved client-funded submission. */
+    onFunded?: (payload: Payload) => Promise<void>) => Promise<Payload>
 }
 export function fundingTypedData(request: Request, channelId: Hex, funding: Funding | FundingIntent, authorizationDomain?: P.AuthorizationDomain): P.TypedData {
   const a = funding.authorization

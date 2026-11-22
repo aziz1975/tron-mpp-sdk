@@ -32,6 +32,7 @@ describe('configured SDK sessions', () => {
   it('binds wallet, adapter, channel IDs and saved state to one SDK deployment', () => {
     const sdk = createConfiguredSession(transport(), options)
     expect(getSessionEscrowAddress).toHaveBeenCalledTimes(1)
+    expect(getSessionEscrowAddress).toHaveBeenCalledWith(chainId)
     vi.mocked(getSessionEscrowAddress).mockReturnValue(other)
     expect(sdk.wallet.adapter.escrowContract).toBe(escrow)
     expect(sdk.adapter.escrowContract).toBe(escrow)

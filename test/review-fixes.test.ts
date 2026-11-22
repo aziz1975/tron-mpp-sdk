@@ -52,7 +52,7 @@ describe('client charge recovery', () => {
       address: `41${token.slice(2)}`, topics: [keccak256(toBytes('Transfer(address,address,uint256)')),
         account.address.slice(2).padStart(64, '0'), recipient.slice(2).padStart(64, '0')], data: (100n).toString(16).padStart(64, '0'),
     }] }))
-    const method = serverCharge({ adapter, chainId, currency: token, recipient, credentialTypes: ['hash'], store: Store.memory() })
+    const method = serverCharge({ adapter, chainId, currency: token, recipient, credentialTypes: ['hash'], authorizeHash: () => account.address, store: Store.memory() })
     const route = Mppx.create({ secretKey: '0123456789abcdef0123456789abcdef', methods: [method] }).charge({ amount: '100' })
     const initial = await route(input)
     if (initial.status !== 402) throw new Error('Expected challenge')

@@ -32,7 +32,7 @@ export const RequestSchema = z.object({
   methodDetails: z.object({
     chainId: P.ChainIdSchema, permit2Address: z.optional(P.AddressSchema),
     spender: z.optional(P.AddressSchema),
-    credentialTypes: z._default(z.array(CredentialTypeSchema).check(z.minLength(1)), ['transaction', 'hash']),
+    credentialTypes: z._default(z.array(CredentialTypeSchema).check(z.minLength(1)), ['transaction']),
     decimals: z.optional(z.number().check(z.int(), z.minimum(0), z.maximum(255))),
     splits: z.optional(z.array(z.object({ recipient: P.AddressSchema, amount: P.Uint256Schema, memo: z.optional(z.string().check(z.maxLength(256))) })).check(z.minLength(1), z.maxLength(10))),
   }),

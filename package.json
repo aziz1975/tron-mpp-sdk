@@ -1,5 +1,5 @@
 {
-  "name": "tron-mpp-sdk",
+  "name": "@trondao/tron-mpp-sdk",
   "version": "0.1.0",
   "description": "MPP payment SDK for TRON TRC-20 charges and escrow sessions.",
   "type": "module",
@@ -55,7 +55,7 @@
   "license": "MIT",
   "peerDependencies": {
     "mppx": ">=0.15.0",
-    "tronweb": ">=6.5.1",
+    "tronweb": "^6.5.2",
     "viem": ">=2.57.12"
   },
   "peerDependenciesMeta": {
@@ -66,17 +66,11 @@
   "devDependencies": {
     "@types/node": "^26.6.5",
     "mppx": "^0.15.0",
-    "tronweb": "^6.5.1",
+    "tronweb": "^6.5.2",
     "tsup": "^9.0.0",
     "typescript": "^7.0.2",
     "viem": "^2.57.12",
     "vitest": "^5.0.5"
-  },
-  "overrides": {
-    "tronweb": {
-      "axios": "^1.20.0"
-    },
-    "follow-redirects": "^1.16.2"
   },
   "dependencies": {
     "@scure/base": "^2.4.0"

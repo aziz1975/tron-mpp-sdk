@@ -11,7 +11,8 @@ export type TronTransport = {
   signTypedData?: P.TypedSigner
   /** Preserve definite VM reverts as ContractCallRevertedError with revert bytes; RPC failures remain distinct. */
   call: (to: Address, data: Hex, from?: Address) => Promise<Hex>
-  send: (to: Address, data: Hex, from?: Address) => Promise<Hex>
+  /** The built-in transport awaits onPrepared after signing and before broadcasting. */
+  send: (to: Address, data: Hex, from?: Address, onPrepared?: (hash: Hex) => Promise<void>) => Promise<Hex>
   /** Validate envelope consistency and ECDSA ownership before returning it. */
   inspectTransaction: (envelope: string, payer?: Address) => Promise<{ hash: Hex; from: Address; to: Address; data: Hex }>
   signTransaction: (to: Address, data: Hex) => Promise<string>
@@ -58,13 +59,15 @@ export function createTronWebTransport(tronWeb: TronWeb, options: { chainId: num
       if (!result.result?.result || !result.constant_result?.length) throw new Error('Contract simulation/read failed.')
       return `0x${result.constant_result[0]}` as Hex
     },
-    async send(to, data, from = owner) {
+    async send(to, data, from = owner, onPrepared) {
       let signed
+      let hash: Hex
       try {
         if (from && owner && !P.isSameAddress(from, owner)) throw new InvalidRequestError('Configured sender mismatch.')
         signed = await tronWeb.trx.sign(await build(to, data, from))
+        hash = P.Bytes32Schema.parse(`0x${signed.txID}`)
+        await onPrepared?.(hash)
       } catch (cause) { throw new TransactionNotSubmittedError(cause) }
-      const hash = P.Bytes32Schema.parse(`0x${signed.txID}`)
       let result
       try { result = await tronWeb.trx.sendRawTransaction(signed) }
       catch (cause) { throw new TransactionOutcomeUnknownError(hash, cause) }

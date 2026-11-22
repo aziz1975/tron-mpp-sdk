@@ -22,7 +22,7 @@ Ethereum RLP transactions and ERC-4337 entry points are not implemented.
 | `charge/permit2` | Explicit deployed TRON Permit2 and submitting spender; prior token approval; single/batch witness transfers and ordered splits |
 | `charge/authorization` | Opt-in, only for a token configured with its actual EIP-3009 domain and entry point |
 | `charge/transaction` | Client signs a TRON transaction; server validates its protobuf/JSON consistency, signature, owner, token and exact calldata before broadcasting |
-| `charge/hash` | Client broadcasts; server confirms receipt and every required token event; single-use transaction hash |
+| `charge/hash` | Client broadcasts with explicit opt-in. The server authorizes the hash for an order and verifies the payer and token events. |
 | `session` core | Open, topUp, cumulative vouchers, settle, cooperative close, requestClose and withdraw |
 | Session sponsored deposits | Permit2 witness or token-native `receiveWithAuthorization(bytes signature)` |
 | Session relayed settle/close | Separate typed payee authorization plus voucher, shared nonce used-set |
@@ -48,9 +48,9 @@ function `permitBatchWitnessTransferFrom`; deployed Permit2 uses an overload of
 ## Charge server
 
 ```ts
-import { Mppx, tron, Store } from 'tron-mpp-sdk/server'
-import { chains } from 'tron-mpp-sdk'
-import { createTronWebTransport, createChargeAdapter } from 'tron-mpp-sdk/tronweb'
+import { Mppx, tron, Store } from '@trondao/tron-mpp-sdk/server'
+import { chains } from '@trondao/tron-mpp-sdk'
+import { createTronWebTransport, createChargeAdapter } from '@trondao/tron-mpp-sdk/tronweb'
 
 // relayerTronWeb holds the submitting account; bind it to the correct node.
 const transport = createTronWebTransport(relayerTronWeb, { chainId: chains.nile })
@@ -86,9 +86,9 @@ client spending policy uses atomic units.
 ## Charge client
 
 ```ts
-import { Mppx, tron } from 'tron-mpp-sdk/client'
-import { chains } from 'tron-mpp-sdk'
-import { createTronWebTransport, createChargeAdapter } from 'tron-mpp-sdk/tronweb'
+import { Mppx, tron } from '@trondao/tron-mpp-sdk/client'
+import { chains } from '@trondao/tron-mpp-sdk'
+import { createTronWebTransport, createChargeAdapter } from '@trondao/tron-mpp-sdk/tronweb'
 
 const adapter = createChargeAdapter(
   createTronWebTransport(walletTronWeb, { chainId: chains.nile }),
@@ -117,10 +117,16 @@ before payment, including when calling `createCredential` directly.
 Client selection follows the server's preference order, intersected with wallet
 capabilities and optional local `credentialTypes`. The user must approve the
 configured TRON Permit2 contract separately before Permit2 payments. The SDK never
-creates an unlimited approval automatically. Hardware/broadcast-only wallets can
-restrict local types to `['hash']`. Hash mode has the charge draft's weaker binding:
-a public transaction hash is not itself payer authentication. Prefer signed
-transactions or Permit2, and apply application authentication when using hashes.
+creates an unlimited approval automatically. The server defaults to
+`['transaction']`. To use hash charges, include `'hash'` in `credentialTypes` on
+both sides and configure the server's `authorizeHash({ challenge, hash, capturedRequest })`
+callback. Use the authenticated caller and your order records to verify that the
+hash belongs to the challenged order, then return the expected wallet address or
+`null` to deny the attempt. The SDK matches the receipt against that wallet. A
+credential's `source` is a payer assertion, and the server rejects it if it conflicts
+with the authenticated wallet. For HTTP integrations, `capturedRequest` supplies the
+request's headers and URL for application authentication. Use a shared persistent
+atomic store to keep transaction replay protection across server instances or restarts.
 
 TRON `transaction.signature` is a serialized signed TRON transaction JSON envelope,
 not an Ethereum RLP string. `hash` is always `0x` followed by 32 bytes, even though
@@ -152,8 +158,8 @@ points before advertising sponsored formats. SUN.io publishes a TRON Permit2
 deployment, but a deployment on Nile/Shasta must be configured independently.
 
 ```ts
-import { Mppx, tron, Store } from 'tron-mpp-sdk/server'
-import { createSessionAdapter } from 'tron-mpp-sdk/tronweb'
+import { Mppx, tron, Store } from '@trondao/tron-mpp-sdk/server'
+import { createSessionAdapter } from '@trondao/tron-mpp-sdk/tronweb'
 
 const sessionMethod = tron.session({
   adapter: createSessionAdapter(serverTransport, escrowAddress),
@@ -224,8 +230,8 @@ channels cannot be pruned. The closed channel tombstone remains permanently, so
 pruning cannot reopen a channel or authorize another debit.
 
 ```ts
-import { Mppx, tron } from 'tron-mpp-sdk/client'
-import { createSessionWallet } from 'tron-mpp-sdk/tronweb'
+import { Mppx, tron } from '@trondao/tron-mpp-sdk/client'
+import { createSessionWallet } from '@trondao/tron-mpp-sdk/tronweb'
 import { Credential } from 'mppx'
 
 const wallet = createSessionWallet(clientTransport, escrowAddress)
@@ -279,7 +285,7 @@ verified through the configured adapter.
 
 `tron.session` creates a fresh proof automatically after wallet execution. For
 manual HTTP credentials, call `authorizeSessionRequest(challenge, payload,
-signTypedData)` from `tron-mpp-sdk/client`, then serialize the returned payload.
+signTypedData)` from `@trondao/tron-mpp-sdk/client`, then serialize the returned payload.
 Retries of a service credential that already succeeded are rejected; the SDK
 does not cache protected-handler responses. A new signed nonce authorizes a new
 billable request, subject to the accepted voucher's remaining credit.
@@ -294,7 +300,8 @@ Management top-ups and closes may operate on an exhausted channel. Prepared
 updates must match an advertised resume channel.
 
 The wallet helper's `open`/`topUp` explicitly approve the escrow for the requested
-amount and wait for confirmed funding. Supply `voucherSigner` when delegating to
+amount and wait for confirmed funding. An opening deposit must cover at least one
+service unit before the wallet signs or approves. Supply `voucherSigner` when delegating to
 another signing key. Prepared sponsored opens/top-ups use the draft's authorization
 fields without signatures. The wallet signs them after policy checks; configure
 its `authorizationDomain` for EIP-3009. On Permit2 paths it checks the deployed
@@ -392,6 +399,16 @@ errors occur before the server has a journal, so `chargeMethod.reconcile` cannot
 recover them. Applications can confirm the known transfer and submit its hash
 against an active matching challenge under their hash-payment policy, or arrange
 service delivery/refund. They must not automatically broadcast another transfer.
+
+For a wallet-funded session, `SessionFundingPendingError` exposes the channel ID
+and the transaction hash when available. Retry the same plan with an active challenge
+and the same wallet or `fundingStore`. The wallet verifies the saved escrow event and
+uses the original channel and voucher. Pass a persistent atomic `fundingStore` to
+`createSessionWallet` or `createConfiguredSession` for recovery after a restart. The
+default store lives in the wallet instance's memory. The built-in transport saves the
+signed transaction hash before broadcasting. If the submission remains unresolved,
+check the original transaction before clearing the funding record. Save the completed
+credential before submitting it to the server so HTTP retries can reuse it.
 
 Close and settle use persisted operation
 records too. A confirmed revert or a `TransactionNotSubmittedError` clears that

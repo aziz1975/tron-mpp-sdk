@@ -1,9 +1,11 @@
+import { Store } from 'mppx'
 import { decodeAbiParameters, decodeErrorResult, encodeFunctionData, keccak256, parseAbi, toBytes, type Address, type Hex } from 'viem'
 import * as S from '../protocol/Session.js'
 import { ContractCallRevertedError, InvalidRequestError, SessionError, SessionSimulationError, TransactionRevertedError, TransactionNotSubmittedError, TransactionOutcomeUnknownError } from '../protocol/Errors.js'
 import * as P from '../protocol/Primitives.js'
 import { logAddress, tokenAbi } from './Token.js'
 import { createContractSignatureVerifier, waitForReceipt, transactionStatus, type TronTransport, type ConfirmationOptions } from './Transport.js'
+import { executeWalletFunding } from './WalletFunding.js'
 
 export const escrowAbi = parseAbi([
   'function CLOSE_GRACE_PERIOD() view returns (uint256)',
@@ -133,47 +135,68 @@ export function createSessionRelayer(transport: TronTransport, escrowContract: s
   }
 }
 
-/** Explicit client-funded wallet operations. Each open/topUp performs an exact token approval. */
-export function createSessionWallet(transport: TronTransport, escrowContract: string, options: ConfirmationOptions & { voucherSigner?: P.TypedSigner; authorizationDomain?: P.AuthorizationDomain } = {}) {
+export type SessionWalletOptions = ConfirmationOptions & {
+  voucherSigner?: P.TypedSigner
+  authorizationDomain?: P.AuthorizationDomain
+  /** Supply persistent atomic storage to recover in-flight funding across wallet instances or restarts. */
+  fundingStore?: Store.AtomicStore
+}
+
+/** Explicit client-funded wallet operations. Each new open/topUp performs an exact token approval. */
+export function createSessionWallet(transport: TronTransport, escrowContract: string, options: SessionWalletOptions = {}) {
   const escrow = P.normalizeAddress(escrowContract)
   const adapter = createSessionAdapter(transport, escrow, options)
+  const fundingStore = options.fundingStore ?? Store.memory()
   const approve = async (token: Address, deposit: string) => {
     const hash = await transport.send(token, encodeFunctionData({ abi: tokenAbi, functionName: 'approve', args: [escrow, BigInt(deposit)] }))
-    await waitForReceipt(transport, hash, options)
+    try { await waitForReceipt(transport, hash, options) }
+    catch (error) {
+      if (error instanceof TransactionRevertedError || error instanceof TransactionOutcomeUnknownError) throw error
+      throw new TransactionOutcomeUnknownError(hash, error)
+    }
   }
   const voucher = async (channelId: Hex, cumulativeAmount: string) => {
     const sign = options.voucherSigner ?? transport.signTypedData
     if (!sign) throw new InvalidRequestError('Wallet typed-data signing required.')
     return sign(P.voucherTypedData({ chainId: transport.chainId, escrowContract: escrow, channelId, cumulativeAmount }))
   }
-  const open = async (request: S.Request, deposit: string, initialAmount: string, authorizedSigner = P.zeroAddress, guard = () => {}): Promise<S.Payload> => {
-      guard()
-      if (request.methodDetails.chainId !== transport.chainId || !P.isSameAddress(request.methodDetails.escrowContract, escrow)) throw new InvalidRequestError('Wallet network or escrow mismatch.')
-      P.Uint128Schema.parse(deposit)
-      P.Uint128Schema.parse(initialAmount)
-      if (BigInt(deposit) <= 0n || BigInt(initialAmount) > BigInt(deposit)) throw new InvalidRequestError('Invalid deposit or initial voucher.')
-      if (!transport.payer) throw new InvalidRequestError('Payer account required.')
-      const salt = `0x${Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('')}` as Hex
-      const id = P.computeChannelId({ payer: transport.payer, payee: request.recipient, token: request.currency, salt, authorizedSigner, escrowContract: escrow, chainId: transport.chainId })
-      const signature = await voucher(id, initialAmount)
-      guard()
-      await approve(request.currency, deposit)
-      guard()
-      const hash = await transport.send(escrow, encodeFunctionData({ abi: escrowAbi, functionName: 'open', args: [request.recipient, request.currency, BigInt(deposit), salt, authorizedSigner] }))
-      await adapter.verifyTransaction(hash, 'open', id, deposit)
-      return { action: 'open', type: 'hash', channelId: id, hash, cumulativeAmount: initialAmount, signature, salt, authorizedSigner }
-    }
-  const topUp = async (request: S.Request, channelId: Hex, additionalDeposit: string, guard = () => {}): Promise<S.Payload> => {
-      guard()
-      if (request.methodDetails.chainId !== transport.chainId || !P.isSameAddress(request.methodDetails.escrowContract, escrow)) throw new InvalidRequestError('Wallet network or escrow mismatch.')
-      P.Uint128Schema.parse(additionalDeposit)
-      if (BigInt(additionalDeposit) === 0n) throw new InvalidRequestError('Deposit must be positive.')
-      await approve(request.currency, additionalDeposit)
-      guard()
-      const hash = await transport.send(escrow, encodeFunctionData({ abi: escrowAbi, functionName: 'topUp', args: [channelId, BigInt(additionalDeposit)] }))
-      await adapter.verifyTransaction(hash, 'topUp', channelId, additionalDeposit)
-      return { action: 'topUp', type: 'hash', channelId, hash, additionalDeposit }
-    }
+  const fund = (request: S.Request, plan: Extract<S.PaymentPlan, { type: 'hash' }>, guard = () => {}, onFunded?: (payload: S.Payload) => Promise<void>) => {
+    guard()
+    const { chainId } = transport
+    if (request.methodDetails.chainId !== chainId || !P.isSameAddress(request.methodDetails.escrowContract, escrow)) throw new InvalidRequestError('Wallet network or escrow mismatch.')
+    if (!transport.payer) throw new InvalidRequestError('Payer account required.')
+    const payer = P.normalizeAddress(transport.payer)
+    const { currency, recipient } = request
+    const amount = plan.action === 'open' ? plan.deposit : plan.additionalDeposit
+    if (plan.action === 'open') S.assertOpeningPlan(request, plan)
+    if (BigInt(amount) === 0n) throw new InvalidRequestError('Deposit must be positive.')
+    const authorizedSigner = plan.action === 'open' ? plan.authorizedSigner ?? P.zeroAddress : P.zeroAddress
+    const scope = plan.action === 'open' ? [currency, recipient] : [plan.channelId]
+    const key = `tron:wallet-funding:${JSON.stringify([chainId, escrow, payer, plan.action, ...scope])}`
+    const binding = JSON.stringify([currency, recipient, amount, plan.action === 'open' ? plan.cumulativeAmount : '', authorizedSigner])
+
+    return executeWalletFunding({ store: fundingStore, key, binding, onFunded,
+      async prepare() {
+        if (plan.action === 'topUp') return { ...plan }
+        const salt = `0x${Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('')}` as Hex
+        const channelId = P.computeChannelId({ payer, payee: recipient, token: currency, salt, authorizedSigner, escrowContract: escrow, chainId })
+        const signature = await voucher(channelId, plan.cumulativeAmount)
+        return { action: 'open', type: 'hash', channelId, signature, salt, authorizedSigner, cumulativeAmount: plan.cumulativeAmount }
+      },
+      async approve() {
+        guard()
+        await approve(currency, amount)
+        guard()
+      },
+      submit(draft, onPrepared) {
+        const data = draft.action === 'open'
+          ? encodeFunctionData({ abi: escrowAbi, functionName: 'open', args: [recipient, currency, BigInt(amount), draft.salt, draft.authorizedSigner] })
+          : encodeFunctionData({ abi: escrowAbi, functionName: 'topUp', args: [draft.channelId, BigInt(amount)] })
+        return transport.send(escrow, data, undefined, onPrepared)
+      },
+      confirm: (hash, draft) => adapter.verifyTransaction(hash, draft.action, draft.channelId, amount),
+    })
+  }
   const signedFunding = async (request: S.Request, id: Hex, intent: S.FundingIntent, guard: () => void): Promise<S.Funding> => {
     S.assertFundingTerms(request, id, intent)
     if (!transport.payer || !P.isSameAddress(intent.authorization.from, transport.payer)) throw new InvalidRequestError('Funding wallet payer mismatch.')
@@ -196,21 +219,21 @@ export function createSessionWallet(transport: TronTransport, escrowContract: st
       if (!sign) throw new InvalidRequestError('Wallet request signing required.')
       return sign(data)
     },
-    open: (request: S.Request, deposit: string, initialAmount: string, authorizedSigner = P.zeroAddress) => open(request, deposit, initialAmount, authorizedSigner),
-    topUp: (request: S.Request, channelId: Hex, additionalDeposit: string) => topUp(request, channelId, additionalDeposit),
-    async createPayload(requestInput: S.Request, planInput: S.PaymentPlan, policy: S.ClientPolicy): Promise<S.Payload> {
+    async open(request: S.Request, deposit: string, initialAmount: string, authorizedSigner = P.zeroAddress) {
+      return fund(S.RequestSchema.parse(request), { action: 'open', type: 'hash', deposit, cumulativeAmount: initialAmount, authorizedSigner: P.normalizeAddress(authorizedSigner) })
+    },
+    async topUp(request: S.Request, channelId: Hex, additionalDeposit: string) {
+      return fund(S.RequestSchema.parse(request), { action: 'topUp', type: 'hash', channelId: P.Bytes32Schema.parse(channelId), additionalDeposit: P.Uint128Schema.parse(additionalDeposit) })
+    },
+    async createPayload(requestInput: S.Request, planInput: S.PaymentPlan, policy: S.ClientPolicy, onFunded?: (payload: S.Payload) => Promise<void>): Promise<S.Payload> {
       const request = S.RequestSchema.parse(requestInput)
       const plan = S.PaymentPlanSchema.parse(planInput)
       const guard = () => S.assertClientPolicy(plan, policy)
       guard()
       if (request.methodDetails.chainId !== transport.chainId || !P.isSameAddress(request.methodDetails.escrowContract, escrow)) throw new InvalidRequestError('Wallet network or escrow mismatch.')
       if ('type' in plan && !(request.methodDetails.credentialTypes ?? ['hash']).includes(plan.type)) throw new InvalidRequestError('Session credential type not advertised.')
-      if (plan.action === 'open' && plan.type === 'hash') return open(request, plan.deposit, plan.cumulativeAmount, plan.authorizedSigner, guard)
-      if (plan.action === 'topUp' && plan.type === 'hash') return topUp(request, plan.channelId, plan.additionalDeposit, guard)
-      if (plan.action === 'open') {
-        const a = plan.authorization
-        if (BigInt(plan.cumulativeAmount) > BigInt('value' in a ? a.value : a.permitted.amount)) throw new InvalidRequestError('Initial voucher exceeds deposit.')
-      }
+      if ('type' in plan && plan.type === 'hash') return fund(request, plan, guard, onFunded)
+      if (plan.action === 'open') S.assertOpeningPlan(request, plan)
       if (plan.action === 'voucher' || plan.action === 'close') {
         const deposit = plan.action === 'voucher' && plan.deposit ? await signedFunding(request, plan.channelId, plan.deposit, guard) : undefined
         guard()

@@ -32,6 +32,7 @@ export function charge(parameters: ChargeParameters) {
       const payer = P.normalizeAddress(adapter.payer ?? '')
       const c = { ...challenge, request }
       const type = request.methodDetails.credentialTypes.find(t => {
+        if (t === 'hash' && !parameters.credentialTypes?.includes(t)) return false
         if (parameters.credentialTypes && !parameters.credentialTypes.includes(t)) return false
         if (request.methodDetails.splits?.length && t !== 'permit2') return false
         if (t === 'permit2') return Boolean(adapter.signTypedData && parameters.permit2 &&

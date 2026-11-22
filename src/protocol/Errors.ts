@@ -33,6 +33,11 @@ export class TransactionOutcomeUnknownError extends Errors.PaymentError {
   }
 }
 
+/** A client-funded session transaction may already have executed. Resume the same funding operation. */
+export class SessionFundingPendingError extends TransactionOutcomeUnknownError {
+  constructor(readonly channelId: Hex, hash?: Hex, cause?: unknown) { super(hash, cause) }
+}
+
 export function parseInput<T>(schema: { parse: (input: unknown) => T }, input: unknown, label: string): T {
   try { return schema.parse(input) }
   catch (error) {

@@ -40,8 +40,8 @@ function adapter() {
     createTransaction: vi.fn(async (_r: C.Request, broadcast: boolean) => broadcast ? hash : '{"signed":"protobuf"}'),
   }
 }
-function client(a = adapter(), recipients: string[] = [recipient]) {
-  return clientCharge({ adapter: a, chainIds: [chainId], currencies: [token], recipients, maxAtomicAmount: '100', permit2: { address: permit2, spender: recipient }, authorizationDomain: { name: 'Token', version: '2' } })
+function client(a = adapter(), recipients: string[] = [recipient], credentialTypes?: readonly C.CredentialType[]) {
+  return clientCharge({ adapter: a, chainIds: [chainId], currencies: [token], recipients, maxAtomicAmount: '100', permit2: { address: permit2, spender: recipient }, authorizationDomain: { name: 'Token', version: '2' }, ...(credentialTypes ? { credentialTypes } : {}) })
 }
 const echo = (c: C.Challenge) => ({ ...c, method: 'tron' as const, intent: 'charge' as const })
 const transaction: C.Payload = { type: 'transaction', signature: '{"signed":"protobuf"}' }
@@ -51,12 +51,19 @@ function verification(c: C.Challenge, payload: C.Payload = transaction, payerSou
 function fixture(type: C.CredentialType = 'transaction', store: Store.AtomicStore = Store.memory()) {
   const a = adapter(), c = challenge(type)
   const parameters = { adapter: a, store, chainId, currency: token, recipient, credentialTypes: [type],
-    permit2: { address: permit2, spender: recipient }, authorizationDomain: { name: 'Token', version: '2' } }
+    permit2: { address: permit2, spender: recipient }, authorizationDomain: { name: 'Token', version: '2' }, authorizeHash: () => account.address }
   return { a, c, store, parameters, method: serverCharge(parameters) }
 }
 afterEach(() => vi.useRealTimers())
 
 describe('charge client payment policy', () => {
+  it('broadcasts a hash charge only when the client opts in', async () => {
+    const a = adapter(), c = echo(challenge('hash'))
+    await expect(client(a).createCredential({ challenge: c })).rejects.toThrow(/No supported credential type/)
+    expect(a.createTransaction).not.toHaveBeenCalled()
+    await expect(client(a, [recipient], ['hash']).createCredential({ challenge: c })).resolves.toBeTypeOf('string')
+    expect(a.createTransaction).toHaveBeenCalledWith(c.request, true)
+  })
   it('requires a nonempty recipient allowlist', () => {
     expect(() => client(adapter(), [])).toThrow(/recipient/)
   })
@@ -238,11 +245,11 @@ describe('charge settlement recovery', () => {
 describe('optional charge source', () => {
   it.each(['permit2', 'authorization', 'transaction', 'hash'] as const)('accepts a valid %s credential without source', async type => {
     const f = fixture(type)
-    const header = await client(f.a).createCredential({ challenge: echo(f.c) })
+    const header = await client(f.a, [recipient], [type]).createCredential({ challenge: echo(f.c) })
     const payload = C.PayloadSchema.parse(Credential.deserialize(header).payload)
     const options = verification(f.c, payload, '')
     await expect(f.method.verify(options)).resolves.toMatchObject({ reference: hash })
-    if (type === 'hash') expect(f.a.verify).toHaveBeenCalledWith(hash, expect.anything(), undefined)
+    if (type === 'hash') expect(f.a.verify).toHaveBeenCalledWith(hash, expect.anything(), account.address)
     else expect(f.a.submit).toHaveBeenCalledWith(expect.anything(), expect.anything(), account.address)
   })
   it('rejects a supplied source that conflicts with an EIP-3009 signer', async () => {
@@ -264,6 +271,45 @@ describe('optional charge source', () => {
     const t = { chainId, inspectTransaction: vi.fn(async () => ({ hash, from: account.address, to: token, data: encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: [recipient, 100n] }) })) } as unknown as TronTransport
     expect(await createChargeAdapter(t).transactionPayer!('{}')).toBe(account.address)
     expect(t.inspectTransaction).toHaveBeenCalledWith('{}')
+  })
+})
+
+describe('hash charge authorization', () => {
+  it('advertises transaction credentials by default and requires an authorizer to enable hashes', async () => {
+    const a = adapter(), options = { adapter: a, chainId, currency: token, recipient }
+    expect(() => serverCharge({ ...options, credentialTypes: ['hash'] })).toThrow(/authorizeHash/)
+    const method = serverCharge(options)
+    const route = Mppx.create({ secretKey: '0123456789abcdef0123456789abcdef', methods: [method] }).charge({ amount: '100' })
+    const result = await route(new Request('https://api.test/paid'))
+    if (result.status !== 402) throw new Error('Expected charge challenge.')
+    expect(C.RequestSchema.parse(Challenge.fromResponse(result.challenge).request).methodDetails.credentialTypes).toEqual(['transaction'])
+    await expect(method.verify(verification(challenge('hash'), { type: 'hash', hash }))).rejects.toThrow(/Unconfigured credential type/)
+    expect(a.verify).not.toHaveBeenCalled()
+  })
+
+  it('binds the hash to an authenticated order and verifies the receipt against the trusted payer', async () => {
+    const a = adapter()
+    const method = serverCharge({ adapter: a, chainId, currency: token, recipient, credentialTypes: ['hash'],
+      authorizeHash: ({ challenge, hash: submitted, capturedRequest }) =>
+        capturedRequest?.headers.get('x-test-account') === 'authenticated' && challenge.request.externalId === 'order-1' && submitted === hash
+          ? account.address : null })
+    const route = Mppx.create({ secretKey: '0123456789abcdef0123456789abcdef', methods: [method] }).charge({ amount: '100', externalId: 'order-1' })
+    const url = 'https://api.test/paid', result = await route(new Request(url))
+    if (result.status !== 402) throw new Error('Expected charge challenge.')
+    const issued = Challenge.fromResponse(result.challenge)
+    const call = (submitted: Hex, identity?: string, authenticated = true) => {
+      const headers = new Headers({ Authorization: Credential.serialize(Credential.from({
+        challenge: issued, payload: { type: 'hash', hash: submitted }, ...(identity ? { source: identity } : {}),
+      })) })
+      if (authenticated) headers.set('x-test-account', 'authenticated')
+      return route(new Request(url, { headers }))
+    }
+    expect((await call(hash, source, false)).status).toBe(402)
+    expect((await call(`0x${'bb'.repeat(32)}`)).status).toBe(402)
+    expect((await call(hash, P.formatSource(other.address, chainId))).status).toBe(402)
+    expect(a.verify).not.toHaveBeenCalled()
+    expect((await call(hash)).status).toBe(200)
+    expect(a.verify).toHaveBeenCalledWith(hash, expect.objectContaining({ externalId: 'order-1' }), account.address)
   })
 })
 
